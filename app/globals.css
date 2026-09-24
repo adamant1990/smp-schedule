@@ -28,3 +28,5 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;p
 @media(max-width:800px){.schedule-toolbar{grid-template-columns:1fr}.schedule-actions{width:100%}.schedule-actions button{flex:1}.schedule-summary{justify-content:flex-start;flex-wrap:wrap}.schedule-table .sticky-name{min-width:190px;max-width:190px}.schedule-table .brigade-head,.schedule-table .brigade-cell{left:190px}.schedule-table .hours-head,.schedule-table .hours-cell{left:260px}}
 
 .warning-text{color:#b54708;font-weight:700}.shift-empty{background:#fff}
+
+.shift-absence{background:#fff1f2;border-color:#fda4af;color:#be123c}.shift-817{background:#f0fdf4;border-color:#86efac}.schedule-toolbar select{min-width:270px}.schedule-toolbar{grid-template-columns:180px 300px auto 1fr}@media(max-width:800px){.schedule-toolbar{grid-template-columns:1fr}.schedule-toolbar select{min-width:0}.schedule-actions{width:100%}.schedule-actions button{flex:1}}
