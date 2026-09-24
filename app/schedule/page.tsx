@@ -74,6 +74,7 @@ export default function SchedulePage() {
   const [vacationTo, setVacationTo] = useState("");
   const [vacationSaving, setVacationSaving] = useState(false);
   const [assistantIssues, setAssistantIssues] = useState<AssistantIssue[]>([]);
+  const [assistantCoverage, setAssistantCoverage] = useState<NonNullable<ReturnType<typeof analyzeManualSchedule>>["coverage"]>([]);
   const [assistantChecked, setAssistantChecked] = useState(false);
   const [importingExcel, setImportingExcel] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -130,6 +131,7 @@ export default function SchedulePage() {
     setUnfilledVacancyCount(0);
     setGenerationReasons([]);
     setAssistantIssues([]);
+    setAssistantCoverage([]);
     setAssistantChecked(false);
     setLoading(false);
   }
@@ -234,11 +236,11 @@ export default function SchedulePage() {
       .trim()
       .toLowerCase()
       .replace(/ё/g, "е")
-      .replace(/\\s+/g, " ");
+      .replace(/\s+/g, " ");
   }
 
   function parseImportedShift(value: unknown): string {
-    const raw = String(value ?? "").trim().toUpperCase().replace(/–/g, "-");
+    const raw = String(value ?? "").trim().toUpperCase().replace(/–/g, "-").replace(/\s+/g, "");
     if (!raw) return "";
     if (raw === "В" || raw === "О" || raw === "ВЫХ" || raw === "ВЫХОДНОЙ") return raw === "В" ? "В" : "";
     if (raw === "24" || raw === "8-8" || raw === "08-08" || raw === "8:00-8:00" || raw === "08:00-08:00" || raw.includes("24 Ч") || raw.includes("24Ч")) return "24";
@@ -374,6 +376,7 @@ export default function SchedulePage() {
     setMessage("");
     const result = analyzeManualSchedule(schedule, employees, brigades, absences, year, month);
     setAssistantIssues(result.issues);
+    setAssistantCoverage(result.coverage);
     setAssistantChecked(true);
 
     if (result.issues.length === 0) {
@@ -739,7 +742,35 @@ export default function SchedulePage() {
             </div>
           </div>
 
-          {assistantIssues.length === 0 ? (
+          <div style={{ overflowX: "auto", marginBottom: 16 }}>
+            <table className="schedule-table">
+              <thead>
+                <tr>
+                  <th>День</th>
+                  <th>Всего день</th>
+                  <th>Всего ночь</th>
+                  <th>Бригады (день / ночь)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {assistantCoverage.map((item) => (
+                  <tr key={item.day}>
+                    <td>{String(item.day).padStart(2, "0")}.{String(month + 1).padStart(2, "0")}</td>
+                    <td><strong>{item.dayTotal}/13</strong></td>
+                    <td><strong>{item.nightTotal}/13</strong></td>
+                    <td>
+                      {item.brigades.map((brigade) =>
+                        "Б" + brigade.brigadeNumber + ": " + brigade.day + "/" + brigade.night +
+                        " (норма " + brigade.required + ")"
+                      ).join(" • ")}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+                    {assistantIssues.length === 0 ? (
             <div className="success-box">Все дневные и ночные места закрыты по правилам 5×2 + 3×1.</div>
           ) : (
             <div style={{ display: "grid", gap: 12 }}>
