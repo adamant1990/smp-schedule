@@ -241,7 +241,7 @@ export default function SchedulePage() {
     const raw = String(value ?? "").trim().toUpperCase().replace(/–/g, "-");
     if (!raw) return "";
     if (raw === "В" || raw === "О" || raw === "ВЫХ" || raw === "ВЫХОДНОЙ") return raw === "В" ? "В" : "";
-    if (raw === "24" || raw.includes("24 Ч") || raw.includes("24Ч")) return "24";
+    if (raw === "24" || raw === "8-8" || raw === "08-08" || raw === "8:00-8:00" || raw === "08:00-08:00" || raw.includes("24 Ч") || raw.includes("24Ч")) return "24";
     if (raw === "12Д" || raw === "12 Д" || raw === "8-20" || raw === "08-20" || raw.includes("08:00-20:00")) return "12Д";
     if (raw === "12Н" || raw === "12 Н" || raw === "20-8" || raw === "20-08" || raw.includes("20:00-08:00")) return "12Н";
     if (raw === "8-17" || raw === "08-17" || raw === "08:00-17:00" || raw === "8–17") return "8–17";
