@@ -597,7 +597,9 @@ export function generateSchedule(
     let moved = false;
 
     for (const current of [...shifts]) {
-      if (current.isVacancy || !current.employeeId) continue;
+      // Базовый цикл после этапа 1 не трогаем. Иначе перераспределение
+      // могло бы превратить 24/3 или день/ночь/2 выходных в произвольный график.
+      if (current.isVacancy || !current.employeeId || current.shiftType === "base") continue;
 
       const donor = employees.find(e => e.id === current.employeeId);
       if (!donor) continue;
@@ -773,9 +775,9 @@ export function generateSchedule(
   return {
     shifts,
     cells,
-    vacancyCount: vacancies.length,
+    vacancyCount: vacancyCount,
     filledVacancyCount: filled,
-    unfilledVacancyCount: vacancies.length - filled,
+    unfilledVacancyCount: vacancyCount,
     staffingValid,
     reasons
   };
