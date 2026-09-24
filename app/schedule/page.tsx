@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
+  absenceKind,
   generateSchedule,
   type Absence,
   type Brigade,
@@ -65,6 +66,10 @@ export default function SchedulePage() {
   const [filledVacancyCount, setFilledVacancyCount] = useState(0);
   const [unfilledVacancyCount, setUnfilledVacancyCount] = useState(0);
   const [generationReasons, setGenerationReasons] = useState<string[]>([]);
+  const [vacationEmployeeId, setVacationEmployeeId] = useState("");
+  const [vacationFrom, setVacationFrom] = useState("");
+  const [vacationTo, setVacationTo] = useState("");
+  const [vacationSaving, setVacationSaving] = useState(false);
 
   const days = monthDays(year, month);
   const brigadeMap = useMemo(
@@ -123,6 +128,65 @@ export default function SchedulePage() {
   useEffect(() => {
     void load();
   }, [year, month]);
+
+  async function addVacation() {
+    if (!vacationEmployeeId || !vacationFrom || !vacationTo) {
+      setError("Для отпуска выберите сотрудника и укажите обе даты.");
+      return;
+    }
+    if (vacationFrom > vacationTo) {
+      setError("Дата начала отпуска не может быть позже даты окончания.");
+      return;
+    }
+
+    const employee = employees.find((item) => item.id === vacationEmployeeId);
+    if (!employee) return;
+
+    const overlapsExisting = absences.some(
+      (a) =>
+        a.employee_id === vacationEmployeeId &&
+        absenceKind(a.absence_type) === "vacation" &&
+        a.date_from <= vacationTo &&
+        a.date_to >= vacationFrom
+    );
+    if (overlapsExisting) {
+      setError("У этого сотрудника уже есть пересекающийся отпуск.");
+      return;
+    }
+
+    setVacationSaving(true);
+    setError("");
+    const supabase = createClient();
+    const result = await supabase.from("employee_absences").insert({
+      employee_id: employee.id,
+      absence_type: "отпуск",
+      date_from: vacationFrom,
+      date_to: vacationTo,
+    }).select("id, employee_id, absence_type, date_from, date_to").single();
+
+    if (result.error || !result.data) {
+      setError(result.error?.message || "Не удалось сохранить отпуск.");
+      setVacationSaving(false);
+      return;
+    }
+
+    setAbsences((current) => [...current, result.data as Absence].sort((a, b) => a.date_from.localeCompare(b.date_from)));
+    setVacationFrom("");
+    setVacationTo("");
+    setMessage("Отпуск сохранён. При следующем формировании графика эти дни будут исключены из работы сотрудника.");
+    setVacationSaving(false);
+  }
+
+  async function removeVacation(id: string) {
+    const supabase = createClient();
+    const result = await supabase.from("employee_absences").delete().eq("id", id);
+    if (result.error) {
+      setError(result.error.message);
+      return;
+    }
+    setAbsences((current) => current.filter((item) => item.id !== id));
+    setMessage("Отпуск удалён.");
+  }
 
   useEffect(() => {
     setSchedule((current) => {
@@ -389,6 +453,8 @@ export default function SchedulePage() {
     setGenerating(false);
   }
 
+  const vacations = absences.filter((absence) => absenceKind(absence.absence_type) === "vacation");
+
   const totalAssigned = employees.reduce(
     (sum, employee) =>
       sum +
@@ -457,7 +523,7 @@ export default function SchedulePage() {
           <strong>{monthTitle}</strong>
           <span>Сотрудников: {employees.length}</span>
           <span>Смен: {totalAssigned}</span>
-          <span>Отсутствий: {absences.length}</span>
+          <span>Отсутствий: {absences.length}</span><span>Отпусков: {vacations.length}</span>
           {vacancyCount > 0 && (
             <span className="warning-text">
               Вакансии: {filledVacancyCount}/{vacancyCount}
@@ -478,13 +544,72 @@ export default function SchedulePage() {
         </section>
       )}
 
+      <section className="card">
+        <div className="section-title">
+          <div>
+            <h2>Отпуска сотрудников</h2>
+            <p className="muted">
+              Отпуск не сдвигает основной цикл. В дни отпуска сотрудник не назначается на смену,
+              а его вакансия закрывается по выбранному режиму. Месячная норма автоматически
+              уменьшается пропорционально числу дней отпуска.
+            </p>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(220px, 2fr) 1fr 1fr auto", gap: 12, alignItems: "end" }}>
+          <label>
+            Сотрудник
+            <select value={vacationEmployeeId} onChange={(e) => setVacationEmployeeId(e.target.value)}>
+              <option value="">Выберите сотрудника</option>
+              {employees.map((employee) => (
+                <option key={employee.id} value={employee.id}>{employee.full_name}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            С
+            <input type="date" value={vacationFrom} onChange={(e) => setVacationFrom(e.target.value)} />
+          </label>
+          <label>
+            По
+            <input type="date" value={vacationTo} onChange={(e) => setVacationTo(e.target.value)} />
+          </label>
+          <button className="primary-button" onClick={addVacation} disabled={vacationSaving}>
+            {vacationSaving ? "Сохранение..." : "Добавить отпуск"}
+          </button>
+        </div>
+
+        {vacations.length > 0 && (
+          <div style={{ marginTop: 18, overflowX: "auto" }}>
+            <table className="schedule-table">
+              <thead>
+                <tr><th>Сотрудник</th><th>Период</th><th></th></tr>
+              </thead>
+              <tbody>
+                {vacations.map((vacation) => (
+                  <tr key={vacation.id}>
+                    <td>{employees.find((e) => e.id === vacation.employee_id)?.full_name ?? "—"}</td>
+                    <td>{vacation.date_from} — {vacation.date_to}</td>
+                    <td>
+                      <button className="secondary-button" onClick={() => removeVacation(vacation.id)}>
+                        Удалить
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
       <section className="card schedule-card">
         <div className="section-title">
           <div>
             <h2>Месячная таблица</h2>
             <p className="muted schedule-hint">
               24 — сутки, 12Д — 08:00–20:00, 12Н — 20:00–08:00, 8–17 — дневная смена.
-              «В» означает отсутствие. Замены и временное уплотнение показываются в строке фактически назначенного сотрудника.
+              «О» означает отпуск, «В» — другое отсутствие. Замены и временное уплотнение показываются в строке фактически назначенного сотрудника.
             </p>
           </div>
         </div>
@@ -531,7 +656,7 @@ export default function SchedulePage() {
                             className={
                               "shift-cell " +
                               (absentCell
-                                ? "shift-absence"
+                                ? (absenceKind(absences.find((a) => a.employee_id === employee.id && a.date_from <= `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}` && a.date_to >= `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`)?.absence_type ?? "") === "vacation" ? "shift-vacation" : "shift-absence")
                                 : value === "24"
                                   ? "shift-24"
                                   : value === "12Д"
