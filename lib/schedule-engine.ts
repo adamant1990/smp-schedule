@@ -420,7 +420,7 @@ export function generateSchedule(
   }
 
   let vacancyCount = 0;
-  let filled = 0;
+  let stage2Filled = 0;
 
   for (let day = 1; day <= days; day++) {
     for (const brigade of staffing.active) {
@@ -439,7 +439,7 @@ export function generateSchedule(
             addShift(e24, brigade.id, day, "24",
               mode === "B" ? "temporary_densification" : "replacement",
               "Этап 2: дополнительная 24-часовая смена.");
-            filled++;
+            stage2Filled++;
             continue;
           }
         }
@@ -451,7 +451,7 @@ export function generateSchedule(
             addShift(e12d, brigade.id, day, "12Д",
               mode === "B" ? "temporary_densification" : "replacement",
               "Этап 2: дополнительная дневная смена.");
-            filled++;
+            stage2Filled++;
             continue;
           }
         }
@@ -463,7 +463,7 @@ export function generateSchedule(
             addShift(e12n, brigade.id, day, "12Н",
               mode === "B" ? "temporary_densification" : "replacement",
               "Этап 2: дополнительная ночная смена.");
-            filled++;
+            stage2Filled++;
             continue;
           }
         }
