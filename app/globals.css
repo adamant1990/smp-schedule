@@ -22,3 +22,4 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;p
 .actions{display:flex;gap:10px}.link-button{border:0;background:none;padding:0;color:#175cd3}.status-ok,.status-off{font-size:12px;padding:4px 8px;border-radius:999px}.status-ok{background:#ecfdf3;color:#027a48}.status-off{background:#f2f4f7;color:#667085}
 .error-box{margin-top:12px;background:#fef3f2;color:#b42318;border:1px solid #fecdca;border-radius:9px;padding:10px 12px;font-size:14px}
 @media(max-width:800px){.topbar{align-items:flex-start;flex-direction:column}.employee-form{grid-template-columns:1fr}.employee-form .primary-button{width:100%}}
+.success-box{margin-top:12px;background:#ecfdf3;color:#027a48;border:1px solid #abefc6;border-radius:9px;padding:10px 12px;font-size:14px}
