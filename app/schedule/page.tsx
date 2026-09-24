@@ -206,25 +206,24 @@ export default function SchedulePage() {
     });
   }, [employees, days]);
 
-  function manualValues(employee: Employee): string[] {
-    if (employee.work_schedule_type === "day_night_2_off") return ["", "12Д", "12Н"];
-    if (employee.work_schedule_type === "8_17") return ["", "8–17"];
-    return ["", "24"];
-  }
+  const manualShiftOptions: Array<{ value: ShiftLabel | ""; label: string }> = [
+    { value: "", label: "—" },
+    { value: "12Д", label: "12Д" },
+    { value: "12Н", label: "12Н" },
+    { value: "24", label: "24" },
+    { value: "8–17", label: "8–17" },
+  ];
 
-  function changeCell(employee: Employee, day: number) {
-    const values = manualValues(employee);
-    setSchedule((current) => {
-      const currentValue = current[employee.id]?.[day] ?? "";
-      const index = values.indexOf(currentValue);
-      return {
-        ...current,
-        [employee.id]: {
-          ...(current[employee.id] ?? {}),
-          [day]: values[(index + 1) % values.length],
-        },
-      };
-    });
+  function changeCell(employee: Employee, day: number, value: string) {
+    setSchedule((current) => ({
+      ...current,
+      [employee.id]: {
+        ...(current[employee.id] ?? {}),
+        [day]: value,
+      },
+    }));
+    setAssistantChecked(false);
+    setAssistantIssues([]);
   }
 
   function clearSchedule() {
@@ -723,6 +722,7 @@ export default function SchedulePage() {
           <div>
             <h2>Месячная таблица</h2>
             <p className="muted schedule-hint">
+              В каждой ячейке можно напрямую выбрать: 12Д, 12Н, 24 или 8–17.
               24 — сутки, 12Д — 08:00–20:00, 12Н — 20:00–08:00, 8–17 — дневная смена.
               Сначала вручную расставьте базовый график. После этого нажмите «Проверить и помочь закрыть дыры».
               Ассистент предложит дополнительные смены, но не будет менять уже поставленные вами.
@@ -768,12 +768,22 @@ export default function SchedulePage() {
                       const absentCell = value === "В";
                       return (
                         <td key={day}>
-                          <button
-                            className={
-                              "shift-cell " +
-                              (absentCell
-                                ? (absenceKind(absences.find((a) => a.employee_id === employee.id && a.date_from <= `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}` && a.date_to >= `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`)?.absence_type ?? "") === "vacation" ? "shift-vacation" : "shift-absence")
-                                : value === "24"
+                          {absentCell ? (
+                            <button
+                              className={
+                                "shift-cell " +
+                                (absenceKind(absences.find((a) => a.employee_id === employee.id && a.date_from <= `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}` && a.date_to >= `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`)?.absence_type ?? "") === "vacation" ? "shift-vacation" : "shift-absence")
+                              }
+                              disabled
+                              aria-label={employee.full_name + ", день " + day}
+                            >
+                              {value}
+                            </button>
+                          ) : (
+                            <select
+                              className={
+                                "shift-cell " +
+                                (value === "24"
                                   ? "shift-24"
                                   : value === "12Д"
                                     ? "shift-820"
@@ -782,13 +792,18 @@ export default function SchedulePage() {
                                       : value === "8–17"
                                         ? "shift-817"
                                         : "shift-empty")
-                            }
-                            onClick={absentCell ? undefined : () => changeCell(employee, day)}
-                            disabled={absentCell}
-                            aria-label={employee.full_name + ", день " + day}
-                          >
-                            {value}
-                          </button>
+                              }
+                              value={value}
+                              onChange={(event) => changeCell(employee, day, event.target.value)}
+                              aria-label={employee.full_name + ", день " + day + ", смена"}
+                            >
+                              {manualShiftOptions.map((option) => (
+                                <option key={option.value || "empty"} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                          )}
                         </td>
                       );
                     })}
