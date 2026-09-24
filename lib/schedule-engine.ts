@@ -165,11 +165,68 @@ function candidateOK(
   if (!e.active || !e.main_brigade_id || !employed(e, year, month, day)) return false;
   if (absent(e, year, month, day, absences)) return false;
   if (extraOnly && !e.can_extra_shifts) return false;
+
   const probe: GeneratedShift = {
-    employeeId: e.id, brigadeId: e.main_brigade_id, day, label,
-    hours: shiftHours(label), shiftType: "replacement", isVacancy: false
+    employeeId: e.id,
+    brigadeId: e.main_brigade_id,
+    day,
+    label,
+    hours: shiftHours(label),
+    shiftType: "replacement",
+    isVacancy: false
   };
-  return !shifts.some(s => s.employeeId === e.id && overlaps(s, probe));
+
+  const own = shifts.filter(s => s.employeeId === e.id);
+
+  // Never put a shift on top of another shift.
+  if (own.some(s => overlaps(s, probe))) return false;
+
+  // A night shift must be followed by a real rest period:
+  // 12Н -> 12Д/8–17/24 on the next day is forbidden.
+  for (const s of own) {
+    if (s.label === "12Н" && day === s.day + 1) {
+      if (label === "12Д" || label === "8–17" || label === "24") return false;
+    }
+    if (label === "12Н" && s.day === day + 1) {
+      // A shift ending at 08:00 is not enough rest before the next night.
+      if (s.label === "12Д" || s.label === "24" || s.label === "8–17") return false;
+    }
+  }
+
+  // For a 24-hour shift there must be at least the following calendar day
+  // free. Extra 12-hour work is allowed later between the regular 24/3 shifts.
+  for (const s of own) {
+    if (s.label === "24" && Math.abs(day - s.day) <= 1) return false;
+    if (label === "24" && Math.abs(day - s.day) <= 1) return false;
+  }
+
+  // Extra work must not destroy the employee's basic cycle.
+  // A 12-hour employee may work the natural day+night pair, but an extra
+  // assignment cannot create a third consecutive working day.
+  if (e.work_schedule_type === "day_night_2_off") {
+    const workDays = new Set(own.map(s => s.day));
+    workDays.add(day);
+    let run = 0;
+    for (let d = 1; d <= daysInMonth(year, month); d++) {
+      if (workDays.has(d)) {
+        run++;
+        if (run > 2) return false;
+      } else {
+        run = 0;
+      }
+    }
+  }
+
+  // 24/3 employees may take extra work between their 24-hour shifts, but
+  // never another 24-hour shift immediately after one.
+  if (e.work_schedule_type === "24/3") {
+    const work24 = own.filter(s => s.label === "24").map(s => s.day);
+    if (label === "24" && work24.some(d => Math.abs(d - day) < 4)) return false;
+    // A 12-hour extra is allowed between 24-hour shifts, provided it does
+    // not overlap and does not violate the night-rest rule above.
+  }
+
+  return true;
 }
 
 function cycleLabel(e: Employee, day: number, phase: number, year: number, month: number): ShiftLabel | null {
@@ -264,18 +321,47 @@ export function generateSchedule(
     const workedMonth = hoursForEmployeeInMonth(e.id, shifts);
     const target = adjustedMonthlyTarget(e, year, month, absences);
     const deficit = target - workedMonth;
+    const ratio = target > 0 ? deficit / target : 0;
 
-    // Strongly prefer the employee's main brigade for a base position.
-    // When the main brigade has more available staff than its daily quota,
-    // extra-capable employees can cover positions in other brigades.
-    const brigadePenalty = e.main_brigade_id === brigadeId ? 0 : 1000;
+    // Main-brigade staff are preferred, but workload balancing is stronger
+    // than the brigade preference when the difference in monthly hours is large.
+    const brigadePenalty = e.main_brigade_id === brigadeId ? 0 : 35;
 
-    // Employees below their monthly norm get priority. For ordinary
-    // employees the norm is a minimum, not a weekly/hourly ceiling.
-    // Extra-shift employees are also allowed to accumulate hours above norm.
-    const deficitPriority = Math.max(0, deficit);
-    const surplusPenalty = e.can_extra_shifts ? 0 : Math.max(0, -deficit);
-    return brigadePenalty - deficitPriority * 10 + surplusPenalty * 2 + workedMonth / 1000 + day / 100000;
+    // The primary criterion is the relative deficit to the monthly norm.
+    // This makes 120/168 preferable to 160/168, rather than simply counting
+    // shifts. Whole shifts may naturally make the final total slightly exceed
+    // the norm.
+    const deficitPriority = Math.max(0, ratio);
+
+    // Prevent the generator from repeatedly choosing the same people.
+    const shiftCount = shifts.filter(s => s.employeeId === e.id).length;
+    const lastWorked = shifts
+      .filter(s => s.employeeId === e.id)
+      .reduce((max, s) => Math.max(max, s.day), 0);
+    const daysSinceLast = lastWorked ? Math.max(0, day - lastWorked) : daysInMonth(year, month) + 1;
+
+    let consecutive = 0;
+    for (let d = day - 1; d >= 1; d--) {
+      if (shifts.some(s => s.employeeId === e.id && s.day === d)) consecutive++;
+      else break;
+    }
+
+    const restPreference = -Math.min(daysSinceLast, 6);
+    const consecutivePenalty = consecutive * 8;
+    const surplusPenalty = Math.max(0, -deficit) * (e.can_extra_shifts ? 0.12 : 1.5);
+
+    return brigadePenalty
+      - deficitPriority * 900
+      + surplusPenalty
+      + shiftCount * 1.5
+      + consecutivePenalty
+      + restPreference;
+  }
+
+  function extraLabels(e: Employee, day: number): ShiftLabel[] {
+    if (!e.can_extra_shifts) return [];
+    const labels: ShiftLabel[] = ["12Д", "12Н", "24"];
+    return labels.filter(label => candidateOK(e, day, label, shifts, year, month, absences, true));
   }
 
   function chooseCandidate(
@@ -297,11 +383,11 @@ export function generateSchedule(
 
     const global: { e: Employee; label: ShiftLabel }[] = employees
       .filter(e => e.main_brigade_id && e.main_brigade_id !== brigadeId && e.can_extra_shifts)
-      .map(e => {
-        const label = availableCycleLabel(e, day);
-        return label ? { e, label } : null;
+      .flatMap(e => {
+        const cycle = availableCycleLabel(e, day);
+        const labels = cycle ? [cycle, ...extraLabels(e, day)] : extraLabels(e, day);
+        return Array.from(new Set(labels)).map(label => ({ e, label }));
       })
-      .filter((x): x is { e: Employee; label: ShiftLabel } => x !== null)
       .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, true))
       .sort((a, b) => assignmentScore(a.e, day, a.label, brigadeId) - assignmentScore(b.e, day, b.label, brigadeId));
 
@@ -496,6 +582,66 @@ export function generateSchedule(
     }
   }
 
+  // Second pass: rebalance the already valid daily staffing toward monthly
+  // norms. A move never changes the number of positions in a brigade/day.
+  // It is accepted only when the receiving employee can legally work the shift
+  // and the donor is above the receiving employee's relative workload.
+  for (let pass = 0; pass < 250; pass++) {
+    let moved = false;
+
+    for (const current of [...shifts]) {
+      if (current.isVacancy || !current.employeeId) continue;
+
+      const donor = employees.find(e => e.id === current.employeeId);
+      if (!donor) continue;
+
+      const donorTarget = adjustedMonthlyTarget(donor, year, month, absences);
+      const donorHours = hoursForEmployeeInMonth(donor.id, shifts);
+      if (donorHours <= donorTarget) continue;
+
+      const receivers = employees
+        .filter(e => e.id !== donor.id && e.active && e.main_brigade_id)
+        .filter(e => {
+          const target = adjustedMonthlyTarget(e, year, month, absences);
+          const hours = hoursForEmployeeInMonth(e.id, shifts);
+          return target > 0 && hours + current.hours < target;
+        })
+        .filter(e => {
+          // Temporarily remove the donor shift while testing the receiver.
+          const idx = shifts.indexOf(current);
+          if (idx >= 0) shifts.splice(idx, 1);
+          const ok = candidateOK(e, current.day, current.label, shifts, year, month, absences, false);
+          if (idx >= 0) shifts.splice(idx, 0, current);
+          return ok;
+        })
+        .sort((a, b) => {
+          const ta = adjustedMonthlyTarget(a, year, month, absences);
+          const tb = adjustedMonthlyTarget(b, year, month, absences);
+          const ha = hoursForEmployeeInMonth(a.id, shifts);
+          const hb = hoursForEmployeeInMonth(b.id, shifts);
+          return (tb - hb) / tb - (ta - ha) / ta;
+        });
+
+      const receiver = receivers[0];
+      if (!receiver) continue;
+
+      // Do not move a shift when it would make the donor fall below norm.
+      if (donorHours - current.hours < donorTarget) continue;
+
+      current.employeeId = receiver.id;
+      current.shiftType = receiver.main_brigade_id === current.brigadeId ? "base" : "replacement";
+      current.note = "Перераспределено вторым проходом по месячной норме часов.";
+      cells[donor.id][current.day] = { label: "", kind: "base" };
+      cells[receiver.id][current.day] = {
+        label: current.label,
+        kind: current.shiftType === "base" ? "base" : "extra"
+      };
+      moved = true;
+    }
+
+    if (!moved) break;
+  }
+
   // target_hours is a MONTHLY norm. It is not a weekly maximum.
   // A non-extra employee must receive at least the monthly norm, but whole
   // shifts may make the actual total slightly higher. Employees with
@@ -570,6 +716,41 @@ export function generateSchedule(
     if (actual < e.target_hours) staffingValid = false;
   }
   if (vacancies.length - filled > 0) staffingValid = false;
+
+  // Hard safety/fairness checks for generated patterns.
+  for (const e of employees) {
+    const own = shifts.filter(s => s.employeeId === e.id).sort((a, b) => a.day - b.day);
+    for (let i = 1; i < own.length; i++) {
+      const prev = own[i - 1];
+      const cur = own[i];
+      if (prev.label === "12Н" && cur.day === prev.day + 1 &&
+          (cur.label === "12Д" || cur.label === "8–17" || cur.label === "24")) {
+        staffingValid = false;
+        reasons.push(e.full_name + ": запрещена дневная смена сразу после ночной.");
+      }
+      if (e.work_schedule_type === "24/3" && prev.label === "24" && cur.label === "24" &&
+          cur.day - prev.day < 4) {
+        staffingValid = false;
+        reasons.push(e.full_name + ": нарушен цикл 24/3.");
+      }
+    }
+
+    if (e.work_schedule_type === "day_night_2_off") {
+      let run = 0;
+      for (let d = 1; d <= days; d++) {
+        if (own.some(s => s.day === d)) {
+          run++;
+          if (run > 2) {
+            staffingValid = false;
+            reasons.push(e.full_name + ": более двух рабочих дней подряд у 12-часового графика.");
+            break;
+          }
+        } else {
+          run = 0;
+        }
+      }
+    }
+  }
 
   return {
     shifts,
