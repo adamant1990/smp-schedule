@@ -144,8 +144,6 @@ function candidateOK(
   if (!e.active || !e.main_brigade_id || !employed(e, year, month, day)) return false;
   if (absent(e, year, month, day, absences)) return false;
   if (extraOnly && !e.can_extra_shifts) return false;
-  const targetWeek = weekKey(year, month, day);
-  if (hoursForEmployeeInWeek(e.id, shifts, year, month, targetWeek) + shiftHours(label) > 48) return false;
   const probe: GeneratedShift = {
     employeeId: e.id, brigadeId: e.main_brigade_id, day, label,
     hours: shiftHours(label), shiftType: "replacement", isVacancy: false
@@ -247,9 +245,12 @@ export function generateSchedule(
     // extra-capable employees can cover positions in other brigades.
     const brigadePenalty = e.main_brigade_id === brigadeId ? 0 : 1000;
 
-    // Lower current workload wins. This prevents alphabetical ordering from
-    // giving the same few people all available cycle days.
-    return brigadePenalty - deficit * 10 + workedMonth / 1000 + day / 100000;
+    // Employees below their monthly norm get priority. For ordinary
+    // employees the norm is a minimum, not a weekly/hourly ceiling.
+    // Extra-shift employees are also allowed to accumulate hours above norm.
+    const deficitPriority = Math.max(0, deficit);
+    const surplusPenalty = e.can_extra_shifts ? 0 : Math.max(0, -deficit);
+    return brigadePenalty - deficitPriority * 10 + surplusPenalty * 2 + workedMonth / 1000 + day / 100000;
   }
 
   function chooseCandidate(
@@ -466,14 +467,29 @@ export function generateSchedule(
     }
   }
 
-  const weeklyHours = new Map<string, number>();
+  // target_hours is a MONTHLY norm. It is not a weekly maximum.
+  // A non-extra employee must receive at least the monthly norm, but whole
+  // shifts may make the actual total slightly higher. Employees with
+  // can_extra_shifts=true have no monthly upper limit.
+  const monthlyHours = new Map<string, number>();
   for (const shift of shifts) {
     if (!shift.employeeId) continue;
-    const key = shift.employeeId + ":" + weekKey(year, month, shift.day);
-    weeklyHours.set(key, (weeklyHours.get(key) ?? 0) + shift.hours);
+    monthlyHours.set(
+      shift.employeeId,
+      (monthlyHours.get(shift.employeeId) ?? 0) + shift.hours
+    );
   }
-  for (const [key, hours] of weeklyHours) {
-    if (hours > 48) reasons.push("Превышение лимита 48 часов: " + key + " = " + hours + " ч.");
+
+  for (const e of employees) {
+    if (!e.active || !e.target_hours || e.can_extra_shifts) continue;
+    const actual = monthlyHours.get(e.id) ?? 0;
+    if (actual < e.target_hours) {
+      reasons.push(
+        e.full_name +
+        ": назначено " + actual +
+        " ч. при месячной норме " + e.target_hours + " ч."
+      );
+    }
   }
 
   const finalDailyCounts = new Map<number, number>();
@@ -515,7 +531,14 @@ export function generateSchedule(
     }
   }
 
-  if ([...weeklyHours.values()].some(hours => hours > 48)) staffingValid = false;
+  // A monthly norm is a minimum for ordinary employees, not a hard cap.
+  // Extra-shift employees are intentionally excluded from this minimum
+  // validation because their workload is unrestricted by the norm.
+  for (const e of employees) {
+    if (!e.active || !e.target_hours || e.can_extra_shifts) continue;
+    const actual = monthlyHours.get(e.id) ?? 0;
+    if (actual < e.target_hours) staffingValid = false;
+  }
   if (vacancies.length - filled > 0) staffingValid = false;
 
   return {
