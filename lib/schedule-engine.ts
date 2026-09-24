@@ -267,6 +267,21 @@ export type AssistantResult = {
   nightMissing: number;
 };
 
+function normalizeManualShiftLabel(value: unknown): ShiftLabel | null {
+  const raw = String(value ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/–/g, "-")
+    .replace(/\\s+/g, "");
+
+  if (!raw) return null;
+  if (raw === "24" || raw === "8-8" || raw === "08-08" || raw === "8:00-8:00" || raw === "08:00-08:00" || raw === "24Ч" || raw === "24ЧАСА") return "24";
+  if (raw === "12Д" || raw === "12D" || raw === "8-20" || raw === "08-20" || raw === "8:00-20:00" || raw === "08:00-20:00") return "12Д";
+  if (raw === "12Н" || raw === "12N" || raw === "20-8" || raw === "20-08" || raw === "20:00-8:00" || raw === "20:00-08:00") return "12Н";
+  if (raw === "8-17" || raw === "08-17" || raw === "8:00-17:00" || raw === "08:00-17:00") return "8–17";
+  return null;
+}
+
 function manualShiftList(
   schedule: Record<string, Record<number, string>>,
   employees: Employee[],
@@ -276,8 +291,8 @@ function manualShiftList(
   const shifts: GeneratedShift[] = [];
   for (const employee of employees) {
     for (let day = 1; day <= daysInMonth(year, month); day++) {
-      const value = schedule[employee.id]?.[day] ?? "";
-      if (value !== "24" && value !== "12Д" && value !== "12Н" && value !== "8–17") continue;
+      const value = normalizeManualShiftLabel(schedule[employee.id]?.[day]);
+      if (!value) continue;
       if (!employee.main_brigade_id) continue;
       shifts.push({
         employeeId: employee.id,
