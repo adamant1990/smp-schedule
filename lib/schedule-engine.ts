@@ -406,72 +406,103 @@ export function generateSchedule(
       : bestLocal;
   }
 
-  // Fill exactly 13 positions every day. First use employees in their own
-  // brigade according to their cycle and current workload. If that brigade
-  // has more cycle-available employees than its quota, an extra-capable
-  // employee may be assigned to another brigade so the whole staff gets a
-  // fair share of the monthly work.
+  // Every brigade must be staffed on BOTH periods:
+  // daytime and nighttime. A 24-hour shift covers both periods, while 12Д
+  // covers only daytime and 12Н covers only nighttime. Therefore the generator
+  // fills the two coverage periods independently and never accepts 13/day as
+  // sufficient when the night is short.
+  function coversDay(label: ShiftLabel) {
+    return label === "24" || label === "12Д" || label === "8–17";
+  }
+
+  function coversNight(label: ShiftLabel) {
+    return label === "24" || label === "12Н";
+  }
+
+  function choosePeriodCandidate(
+    day: number,
+    brigadeId: string,
+    preferred: Employee[],
+    period: "day" | "night"
+  ): { e: Employee; label: ShiftLabel } | undefined {
+    const allowed = (label: ShiftLabel) =>
+      period === "day" ? coversDay(label) : coversNight(label);
+
+    const local = preferred
+      .flatMap(e => {
+        const cycle = availableCycleLabel(e, day);
+        return cycle && allowed(cycle) ? [{ e, label: cycle }] : [];
+      })
+      .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, false));
+
+    const global = employees
+      .filter(e => e.main_brigade_id && e.main_brigade_id !== brigadeId && e.can_extra_shifts)
+      .flatMap(e => {
+        const cycle = availableCycleLabel(e, day);
+        const labels = cycle && allowed(cycle) ? [cycle, ...extraLabels(e, day).filter(allowed)] : extraLabels(e, day).filter(allowed);
+        return Array.from(new Set(labels)).map(label => ({ e, label }));
+      })
+      .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, true));
+
+    return [...local, ...global]
+      .sort((a, b) => assignmentScore(a.e, day, a.label, brigadeId) - assignmentScore(b.e, day, b.label, brigadeId))[0];
+  }
+
   for (let day = 1; day <= days; day++) {
     for (const brigade of staffing.active) {
       const required = staffing.required.get(brigade.id) ?? 0;
       const brigadeEmployees = byBrigade.get(brigade.id) ?? [];
 
-      for (let position = 0; position < required; position++) {
-        const selected = chooseCandidate(day, brigade.id, brigadeEmployees, true);
+      for (const period of ["day", "night"] as const) {
+        for (let position = 0; position < required; position++) {
+          const alreadyCovered = shifts.filter(s =>
+            !s.isVacancy &&
+            s.employeeId &&
+            s.brigadeId === brigade.id &&
+            s.day === day &&
+            (period === "day" ? coversDay(s.label) : coversNight(s.label))
+          ).length;
 
-        if (!selected) {
+          if (alreadyCovered >= required) continue;
+
+          const selected = choosePeriodCandidate(day, brigade.id, brigadeEmployees, period);
+
+          if (!selected) {
+            // A 24-hour vacancy covers the missing period and can later be
+            // replaced by 24h or by 12Д+12Н in Mode A.
+            const vacancyLabel: ShiftLabel = period === "day" ? "24" : "12Н";
+            shifts.push({
+              employeeId: null,
+              brigadeId: brigade.id,
+              day,
+              label: vacancyLabel,
+              hours: shiftHours(vacancyLabel),
+              shiftType: "base",
+              isVacancy: true,
+              note: "Не найден сотрудник для покрытия " + (period === "day" ? "дневной" : "ночной") + " смены."
+            });
+            continue;
+          }
+
+          const { e, label } = selected;
+          const isBase = e.main_brigade_id === brigade.id;
+
           shifts.push({
-            employeeId: null,
-            brigadeId: brigade.id,
-            day,
-            label: "24",
-            hours: 24,
-            shiftType: "base",
-            isVacancy: true,
-            note: "Не найден сотрудник в основном цикле или среди сотрудников, которым разрешены подработки."
-          });
-          continue;
-        }
-
-        const { e, label } = selected;
-        const isBase = e.main_brigade_id === brigade.id;
-        const isAbsent = absent(e, year, month, day, absences);
-
-        if (isAbsent) {
-          shifts.push({
-            employeeId: null,
+            employeeId: e.id,
             brigadeId: brigade.id,
             day,
             label,
             hours: shiftHours(label),
-            shiftType: "base",
-            isVacancy: true,
-            sourceEmployeeId: e.id,
-            note: "Основная смена сохранена как вакансия из-за отсутствия."
+            shiftType: isBase ? "base" : "replacement",
+            isVacancy: false,
+            note: isBase ? undefined : "Подработка в другой бригаде для равномерного распределения нагрузки."
           });
-          const a = absenceForDay(e, year, month, day, absences);
+
           cells[e.id][day] = {
-            label: a && absenceKind(a.absence_type) === "vacation" ? "О" : "В",
-            kind: "absence"
+            label,
+            kind: isBase ? "base" : "extra"
           };
-          continue;
         }
-
-        shifts.push({
-          employeeId: e.id,
-          brigadeId: brigade.id,
-          day,
-          label,
-          hours: shiftHours(label),
-          shiftType: isBase ? "base" : "replacement",
-          isVacancy: false,
-          note: isBase ? undefined : "Подработка в другой бригаде для равномерного распределения нагрузки."
-        });
-
-        cells[e.id][day] = {
-          label,
-          kind: isBase ? "base" : "extra"
-        };
       }
     }
   }
@@ -668,41 +699,52 @@ export function generateSchedule(
     }
   }
 
-  const finalDailyCounts = new Map<number, number>();
-  const finalBrigadeCounts = new Map<number, Map<string, number>>();
-  for (const shift of shifts) {
-    if (!shift.isVacancy && shift.employeeId) {
-      finalDailyCounts.set(shift.day, (finalDailyCounts.get(shift.day) ?? 0) + 1);
-      const byDay = finalBrigadeCounts.get(shift.day) ?? new Map<string, number>();
-      byDay.set(shift.brigadeId, (byDay.get(shift.brigadeId) ?? 0) + 1);
-      finalBrigadeCounts.set(shift.day, byDay);
-    }
-  }
-
+  const finalDayCounts = new Map<number, number>();
+  const finalNightCounts = new Map<number, number>();
   let staffingValid = true;
-  for (let day = 1; day <= days; day++) {
-    const count = finalDailyCounts.get(day) ?? 0;
-    const brigadeCounts = finalBrigadeCounts.get(day) ?? new Map<string, number>();
 
-    if (count !== 13) {
+  for (let day = 1; day <= days; day++) {
+    const dayBrigadeCounts = new Map<string, number>();
+    const nightBrigadeCounts = new Map<string, number>();
+
+    for (const shift of shifts) {
+      if (shift.isVacancy || !shift.employeeId || shift.day !== day) continue;
+      if (coversDay(shift.label)) {
+        finalDayCounts.set(day, (finalDayCounts.get(day) ?? 0) + 1);
+        dayBrigadeCounts.set(shift.brigadeId, (dayBrigadeCounts.get(shift.brigadeId) ?? 0) + 1);
+      }
+      if (coversNight(shift.label)) {
+        finalNightCounts.set(day, (finalNightCounts.get(day) ?? 0) + 1);
+        nightBrigadeCounts.set(shift.brigadeId, (nightBrigadeCounts.get(shift.brigadeId) ?? 0) + 1);
+      }
+    }
+
+    const dayCount = finalDayCounts.get(day) ?? 0;
+    const nightCount = finalNightCounts.get(day) ?? 0;
+
+    if (dayCount !== 13) {
       staffingValid = false;
-      reasons.push(
-        dateOf(year, month, day) +
-        " итоговая укомплектованность: " + count +
-        " фельдшеров вместо 13."
-      );
+      reasons.push(dateOf(year, month, day) + " дневная укомплектованность: " + dayCount + " вместо 13.");
+    }
+    if (nightCount !== 13) {
+      staffingValid = false;
+      reasons.push(dateOf(year, month, day) + " ночная укомплектованность: " + nightCount + " вместо 13.");
     }
 
     for (const [brigadeId, required] of staffing.required) {
-      const actual = brigadeCounts.get(brigadeId) ?? 0;
-      if (actual !== required) {
+      const dayActual = dayBrigadeCounts.get(brigadeId) ?? 0;
+      const nightActual = nightBrigadeCounts.get(brigadeId) ?? 0;
+      const brigadeNumber = brigades.find(b => b.id === brigadeId)?.number ?? brigadeId;
+
+      if (dayActual !== required) {
         staffingValid = false;
-        const brigadeNumber = brigades.find(b => b.id === brigadeId)?.number ?? brigadeId;
-        reasons.push(
-          dateOf(year, month, day) +
-          " бригада " + brigadeNumber +
-          ": " + actual + " фельдшеров вместо " + required + "."
-        );
+        reasons.push(dateOf(year, month, day) + " бригада " + brigadeNumber +
+          " днём: " + dayActual + " вместо " + required + ".");
+      }
+      if (nightActual !== required) {
+        staffingValid = false;
+        reasons.push(dateOf(year, month, day) + " бригада " + brigadeNumber +
+          " ночью: " + nightActual + " вместо " + required + ".");
       }
     }
   }
