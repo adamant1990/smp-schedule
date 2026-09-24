@@ -30,6 +30,11 @@ export type Absence = {
   date_to: string;
 };
 
+export function absenceKind(absenceType: string) {
+  const value = absenceType.toLowerCase();
+  return value.includes("отпуск") || value === "о" || value === "vacation" ? "vacation" : "absence";
+}
+
 export type GeneratedShift = {
   employeeId: string | null;
   brigadeId: string;
@@ -85,9 +90,13 @@ function employed(e: Employee, year: number, month: number, day: number) {
     (!e.employment_end || date <= e.employment_end);
 }
 
-function absent(e: Employee, year: number, month: number, day: number, absences: Absence[]) {
+function absenceForDay(e: Employee, year: number, month: number, day: number, absences: Absence[]) {
   const date = dateOf(year, month, day);
-  return absences.some(a => a.employee_id === e.id && a.date_from <= date && a.date_to >= date);
+  return absences.find(a => a.employee_id === e.id && a.date_from <= date && a.date_to >= date);
+}
+
+function absent(e: Employee, year: number, month: number, day: number, absences: Absence[]) {
+  return Boolean(absenceForDay(e, year, month, day, absences));
 }
 
 function overlaps(a: GeneratedShift, b: GeneratedShift) {
@@ -119,6 +128,18 @@ function hoursForEmployeeInMonth(employeeId: string, shifts: GeneratedShift[]) {
   return shifts
     .filter(s => s.employeeId === employeeId)
     .reduce((sum, s) => sum + s.hours, 0);
+}
+
+function adjustedMonthlyTarget(e: Employee, year: number, month: number, absences: Absence[]) {
+  const target = Math.max(0, e.target_hours || 0);
+  if (!target) return 0;
+  const totalDays = daysInMonth(year, month);
+  let vacationDays = 0;
+  for (let day = 1; day <= totalDays; day++) {
+    const a = absenceForDay(e, year, month, day, absences);
+    if (a && absenceKind(a.absence_type) === "vacation") vacationDays++;
+  }
+  return Math.round(target * Math.max(0, totalDays - vacationDays) / totalDays);
 }
 
 function staffingRequirements(brigades: Brigade[]) {
@@ -195,7 +216,11 @@ export function generateSchedule(
     for (let d = 1; d <= days; d++) cells[e.id][d] = { label: "", kind: "base" };
     for (let d = 1; d <= days; d++) {
       if (absent(e, year, month, d, absences)) {
-        cells[e.id][d] = { label: "В", kind: "absence" };
+        const a = absenceForDay(e, year, month, d, absences);
+        cells[e.id][d] = {
+          label: a && absenceKind(a.absence_type) === "vacation" ? "О" : "В",
+          kind: "absence"
+        };
       }
     }
     if (!e.main_brigade_id) continue;
@@ -237,7 +262,7 @@ export function generateSchedule(
 
   function assignmentScore(e: Employee, day: number, label: ShiftLabel, brigadeId: string) {
     const workedMonth = hoursForEmployeeInMonth(e.id, shifts);
-    const target = Math.max(0, e.target_hours || 0);
+    const target = adjustedMonthlyTarget(e, year, month, absences);
     const deficit = target - workedMonth;
 
     // Strongly prefer the employee's main brigade for a base position.
@@ -338,7 +363,11 @@ export function generateSchedule(
             sourceEmployeeId: e.id,
             note: "Основная смена сохранена как вакансия из-за отсутствия."
           });
-          cells[e.id][day] = { label: "В", kind: "absence" };
+          const a = absenceForDay(e, year, month, day, absences);
+          cells[e.id][day] = {
+            label: a && absenceKind(a.absence_type) === "vacation" ? "О" : "В",
+            kind: "absence"
+          };
           continue;
         }
 
@@ -482,8 +511,9 @@ export function generateSchedule(
 
   for (const e of employees) {
     if (!e.active || !e.target_hours || e.can_extra_shifts) continue;
+    const adjustedTarget = adjustedMonthlyTarget(e, year, month, absences);
     const actual = monthlyHours.get(e.id) ?? 0;
-    if (actual < e.target_hours) {
+    if (actual < adjustedTarget) {
       reasons.push(
         e.full_name +
         ": назначено " + actual +
