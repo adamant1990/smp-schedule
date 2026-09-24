@@ -334,6 +334,37 @@ export function generateSchedule(
     return shift;
   }
 
+  function assignmentScore(e: Employee, day: number, label: ShiftLabel, brigadeId: string) {
+    const workedMonth = hoursForEmployeeInMonth(e.id, shifts);
+    const target = adjustedMonthlyTarget(e, year, month, absences);
+    const deficit = target - workedMonth;
+    const ratio = target > 0 ? deficit / target : 0;
+    const brigadePenalty = e.main_brigade_id === brigadeId ? 0 : 35;
+    const deficitPriority = Math.max(0, ratio);
+    const shiftCount = shifts.filter(s => s.employeeId === e.id).length;
+    const lastWorked = shifts
+      .filter(s => s.employeeId === e.id)
+      .reduce((max, s) => Math.max(max, s.day), 0);
+    const daysSinceLast = lastWorked ? Math.max(0, day - lastWorked) : days + 1;
+
+    let consecutive = 0;
+    for (let d = day - 1; d >= 1; d--) {
+      if (shifts.some(s => s.employeeId === e.id && s.day === d)) consecutive++;
+      else break;
+    }
+
+    const restPreference = -Math.min(daysSinceLast, 6);
+    const consecutivePenalty = consecutive * 8;
+    const surplusPenalty = Math.max(0, -deficit) * (e.can_extra_shifts ? 0.12 : 1.5);
+
+    return brigadePenalty
+      - deficitPriority * 900
+      + surplusPenalty
+      + shiftCount * 1.5
+      + consecutivePenalty
+      + restPreference;
+  }
+
   function coversDay(label: ShiftLabel) {
     return label === "24" || label === "12Д" || label === "8–17";
   }
