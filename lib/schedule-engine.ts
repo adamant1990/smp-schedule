@@ -210,9 +210,18 @@ export function generateSchedule(
       byType.set(e.work_schedule_type, list);
     }
 
-    for (const list of byType.values()) {
+    for (const [type, list] of byType) {
       list.sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"));
-      list.forEach((e, index) => phaseByEmployee.set(e.id, Math.floor(index / Math.max(1, required)) % 4));
+      list.forEach((e, index) => {
+        // 24-hour crews need identical phases in pairs so 2-person brigades
+        // can be staffed on the same 24-hour days.
+        // 12-hour crews must be phased as day/night/off/off so a 2-person
+        // brigade has one day worker and one night worker every calendar day.
+        const phase = type === "day_night_2_off"
+          ? index % 4
+          : Math.floor(index / Math.max(1, required)) % 4;
+        phaseByEmployee.set(e.id, phase);
+      });
     }
   }
 
