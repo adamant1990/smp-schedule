@@ -241,6 +241,219 @@ function cycleLabel(e: Employee, day: number, phase: number, year: number, month
   return weekday === 0 || weekday === 6 ? null : "8–17";
 }
 
+
+export type AssistantCandidate = {
+  employeeId: string;
+  fullName: string;
+  hours: number;
+  targetHours: number;
+  actualHours: number;
+  deficit: number;
+  reason: string;
+};
+
+export type AssistantIssue = {
+  day: number;
+  brigadeId: string;
+  brigadeNumber: number;
+  period: "day" | "night";
+  missing: number;
+  candidates: AssistantCandidate[];
+};
+
+export type AssistantResult = {
+  issues: AssistantIssue[];
+  dayMissing: number;
+  nightMissing: number;
+};
+
+function manualShiftList(
+  schedule: Record<string, Record<number, string>>,
+  employees: Employee[],
+  year: number,
+  month: number
+): GeneratedShift[] {
+  const shifts: GeneratedShift[] = [];
+  for (const employee of employees) {
+    for (let day = 1; day <= daysInMonth(year, month); day++) {
+      const value = schedule[employee.id]?.[day] ?? "";
+      if (value !== "24" && value !== "12Д" && value !== "12Н" && value !== "8–17") continue;
+      if (!employee.main_brigade_id) continue;
+      shifts.push({
+        employeeId: employee.id,
+        brigadeId: employee.main_brigade_id,
+        day,
+        label: value,
+        hours: shiftHours(value),
+        shiftType: "base",
+        isVacancy: false
+      });
+    }
+  }
+  return shifts;
+}
+
+function assistantCandidateOK(
+  employee: Employee,
+  day: number,
+  label: ShiftLabel,
+  shifts: GeneratedShift[],
+  year: number,
+  month: number,
+  absences: Absence[]
+) {
+  if (!employee.active || !employee.main_brigade_id || absent(employee, year, month, day, absences)) return false;
+  if (!employee.can_extra_shifts) return false;
+
+  const probe: GeneratedShift = {
+    employeeId: employee.id,
+    brigadeId: employee.main_brigade_id,
+    day,
+    label,
+    hours: shiftHours(label),
+    shiftType: "replacement",
+    isVacancy: false
+  };
+
+  const own = shifts.filter(s => s.employeeId === employee.id);
+  if (own.some(s => overlaps(s, probe))) return false;
+
+  for (const s of own) {
+    if (s.label === "12Н" && day === s.day + 1 && (label === "12Д" || label === "8–17" || label === "24")) return false;
+    if (label === "12Н" && s.day === day + 1 && (s.label === "12Д" || s.label === "24" || s.label === "8–17")) return false;
+    if (s.label === "24" && Math.abs(day - s.day) <= 1) return false;
+    if (label === "24" && Math.abs(day - s.day) <= 1) return false;
+  }
+
+  if (employee.work_schedule_type === "day_night_2_off") {
+    const workDays = new Set(own.map(s => s.day));
+    workDays.add(day);
+    let run = 0;
+    for (let d = 1; d <= daysInMonth(year, month); d++) {
+      if (workDays.has(d)) {
+        run++;
+        if (run > 2) return false;
+      } else {
+        run = 0;
+      }
+    }
+  }
+
+  if (employee.work_schedule_type === "24/3" && label === "24") {
+    if (own.some(s => s.label === "24" && Math.abs(s.day - day) < 4)) return false;
+  }
+
+  return true;
+}
+
+export function analyzeManualSchedule(
+  schedule: Record<string, Record<number, string>>,
+  employees: Employee[],
+  brigades: Brigade[],
+  absences: Absence[],
+  year: number,
+  month: number
+): AssistantResult {
+  const shifts = manualShiftList(schedule, employees, year, month);
+  const staffing = staffingRequirements(brigades);
+  const issues: AssistantIssue[] = [];
+  let dayMissing = 0;
+  let nightMissing = 0;
+
+  if (!staffing.valid) {
+    return { issues: [], dayMissing: 0, nightMissing: 0 };
+  }
+
+  const hoursByEmployee = new Map<string, number>();
+  for (const shift of shifts) {
+    if (shift.employeeId) hoursByEmployee.set(
+      shift.employeeId,
+      (hoursByEmployee.get(shift.employeeId) ?? 0) + shift.hours
+    );
+  }
+
+  function count(brigadeId: string, day: number, period: "day" | "night") {
+    return shifts.filter(s =>
+      s.brigadeId === brigadeId &&
+      s.day === day &&
+      (period === "day" ? coversManualDay(s.label) : coversManualNight(s.label))
+    ).length;
+  }
+
+  function candidatesFor(brigadeId: string, day: number, period: "day" | "night") {
+    const label: ShiftLabel = period === "day" ? "12Д" : "12Н";
+    const required = staffing.required.get(brigadeId) ?? 0;
+
+    return employees
+      .filter(e => assistantCandidateOK(e, day, label, shifts, year, month, absences))
+      .map(e => {
+        const target = adjustedMonthlyTarget(e, year, month, absences);
+        const actual = hoursByEmployee.get(e.id) ?? 0;
+        const deficit = Math.max(0, target - actual);
+        const sameBrigade = e.main_brigade_id === brigadeId;
+        return {
+          e,
+          target,
+          actual,
+          deficit,
+          sameBrigade,
+          distance: shifts
+            .filter(s => s.employeeId === e.id)
+            .reduce((max, s) => Math.max(max, s.day), 0)
+        };
+      })
+      .sort((a, b) => {
+        if (a.sameBrigade !== b.sameBrigade) return a.sameBrigade ? -1 : 1;
+        if (b.deficit !== a.deficit) return b.deficit - a.deficit;
+        if (a.actual !== b.actual) return a.actual - b.actual;
+        return a.distance - b.distance;
+      })
+      .slice(0, 5)
+      .map(x => ({
+        employeeId: x.e.id,
+        fullName: x.e.full_name,
+        hours: shiftHours(label),
+        targetHours: x.target,
+        actualHours: x.actual,
+        deficit: x.deficit,
+        reason: x.sameBrigade
+          ? "своя бригада; можно взять дополнительную смену"
+          : "другая бригада; подходит по ограничениям"
+      }));
+  }
+
+  function coversManualDay(label: ShiftLabel) {
+    return label === "24" || label === "12Д" || label === "8–17";
+  }
+
+  function coversManualNight(label: ShiftLabel) {
+    return label === "24" || label === "12Н";
+  }
+
+  for (let day = 1; day <= daysInMonth(year, month); day++) {
+    for (const brigade of staffing.active) {
+      const required = staffing.required.get(brigade.id) ?? 0;
+      for (const period of ["day", "night"] as const) {
+        const actual = count(brigade.id, day, period);
+        const missing = Math.max(0, required - actual);
+        if (!missing) continue;
+        if (period === "day") dayMissing += missing;
+        else nightMissing += missing;
+        issues.push({
+          day,
+          brigadeId: brigade.id,
+          brigadeNumber: brigade.number,
+          period,
+          missing,
+          candidates: candidatesFor(brigade.id, day, period)
+        });
+      }
+    }
+  }
+
+  return { issues, dayMissing, nightMissing };
+}
+
 export function generateSchedule(
   employees: Employee[],
   brigades: Brigade[],
