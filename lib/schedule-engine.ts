@@ -259,10 +259,13 @@ export function generateSchedule(
     allowGlobalExtra: boolean
   ): { e: Employee; label: ShiftLabel } | undefined {
     const local: { e: Employee; label: ShiftLabel }[] = preferred
-      .map(e => ({ e, label: availableCycleLabel(e, day) }))
-      .filter(x => x.label !== null)
-      .filter(x => candidateOK(x.e, day, x.label!, shifts, year, month, absences, false))
-      .sort((a, b) => assignmentScore(a.e, day, a.label!, brigadeId) - assignmentScore(b.e, day, b.label!, brigadeId));
+      .map(e => {
+        const label = availableCycleLabel(e, day);
+        return label ? { e, label } : null;
+      })
+      .filter((x): x is { e: Employee; label: ShiftLabel } => x !== null)
+      .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, false))
+      .sort((a, b) => assignmentScore(a.e, day, a.label, brigadeId) - assignmentScore(b.e, day, b.label, brigadeId));
 
     if (!allowGlobalExtra) return local[0];
 
