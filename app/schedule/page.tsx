@@ -4,8 +4,10 @@ import { useEffect, useMemo, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import {
   absenceKind,
+  analyzeManualSchedule,
   generateSchedule,
   type Absence,
+  type AssistantIssue,
   type Brigade,
   type Employee,
   type PlanningMode,
@@ -70,6 +72,8 @@ export default function SchedulePage() {
   const [vacationFrom, setVacationFrom] = useState("");
   const [vacationTo, setVacationTo] = useState("");
   const [vacationSaving, setVacationSaving] = useState(false);
+  const [assistantIssues, setAssistantIssues] = useState<AssistantIssue[]>([]);
+  const [assistantChecked, setAssistantChecked] = useState(false);
 
   const days = monthDays(year, month);
   const brigadeMap = useMemo(
@@ -122,6 +126,8 @@ export default function SchedulePage() {
     setFilledVacancyCount(0);
     setUnfilledVacancyCount(0);
     setGenerationReasons([]);
+    setAssistantIssues([]);
+    setAssistantChecked(false);
     setLoading(false);
   }
 
@@ -227,11 +233,53 @@ export default function SchedulePage() {
     setFilledVacancyCount(0);
     setUnfilledVacancyCount(0);
     setGenerationReasons([]);
+    setAssistantIssues([]);
+    setAssistantChecked(false);
     setMessage("");
     setError("");
   }
 
-  async function generateBaseSchedule() {
+  function checkScheduleWithAssistant() {
+    setError("");
+    setMessage("");
+    const result = analyzeManualSchedule(schedule, employees, brigades, absences, year, month);
+    setAssistantIssues(result.issues);
+    setAssistantChecked(true);
+
+    if (result.issues.length === 0) {
+      setMessage("График проверен: дыр по укомплектованности нет.");
+    } else {
+      setMessage(
+        "Ассистент нашёл " +
+        result.issues.reduce((sum, issue) => sum + issue.missing, 0) +
+        " незакрытых мест. Ни одна уже установленная смена не изменена."
+      );
+    }
+  }
+
+  function applyAssistantCandidate(issue: AssistantIssue, employeeId: string) {
+    const label = issue.period === "day" ? "12Д" : "12Н";
+    setSchedule((current) => ({
+      ...current,
+      [employeeId]: {
+        ...(current[employeeId] ?? {}),
+        [issue.day]: label,
+      },
+    }));
+    setAssistantIssues((current) =>
+      current.map((item) =>
+        item.day === issue.day &&
+        item.brigadeId === issue.brigadeId &&
+        item.period === issue.period
+          ? { ...item, missing: Math.max(0, item.missing - 1), candidates: item.candidates.filter(c => c.employeeId !== employeeId) }
+          : item
+      ).filter(item => item.missing > 0)
+    );
+    setAssistantChecked(true);
+    setMessage("Смена добавлена вручную. Базовый график остальных сотрудников не изменён.");
+  }
+
+    async function generateBaseSchedule() {
     if (generating || employees.length === 0) return;
 
     setGenerating(true);
@@ -476,7 +524,7 @@ export default function SchedulePage() {
           <div className="eyebrow">СМП • ПЛАНИРОВАНИЕ</div>
           <h1>График фельдшеров</h1>
           <p className="muted">
-            Автоматическое планирование с сохранением основного цикла и закрытием вакансий.
+            Вы составляете базовый график, а ассистент проверяет его и помогает закрыть незакрытые смены.
           </p>
         </div>
         <a className="secondary-button" href="/">← Главное меню</a>
@@ -512,10 +560,10 @@ export default function SchedulePage() {
           <button className="secondary-button" onClick={clearSchedule}>Очистить</button>
           <button
             className="primary-button"
-            onClick={generateBaseSchedule}
-            disabled={generating || loading || employees.length === 0}
+            onClick={checkScheduleWithAssistant}
+            disabled={loading || employees.length === 0}
           >
-            {generating ? "Формирование..." : "Сформировать график"}
+            🤖 Проверить и помочь закрыть дыры
           </button>
         </div>
 
@@ -534,6 +582,73 @@ export default function SchedulePage() {
 
       {message && <div className="success-box">{message}</div>}
       {error && <div className="error-box">{error}</div>}
+
+      {assistantChecked && (
+        <section className="card">
+          <div className="section-title">
+            <div>
+              <h2>🤖 Ассистент графика</h2>
+              <p className="muted">
+                Ассистент не переставляет и не удаляет уже поставленные смены.
+                Он только показывает незакрытые места и подходящих сотрудников для дополнительного выхода.
+              </p>
+            </div>
+          </div>
+
+          {assistantIssues.length === 0 ? (
+            <div className="success-box">Все дневные и ночные места закрыты по правилам 5×2 + 3×1.</div>
+          ) : (
+            <div style={{ display: "grid", gap: 12 }}>
+              {assistantIssues.map((issue, index) => (
+                <div key={issue.day + "-" + issue.brigadeId + "-" + issue.period} className="card" style={{ margin: 0, padding: 14 }}>
+                  <strong>
+                    {String(issue.day).padStart(2, "0")}.{String(month + 1).padStart(2, "0")}.{year}
+                    {" • "}бригада {issue.brigadeNumber} • {issue.period === "day" ? "день" : "ночь"}
+                  </strong>
+                  <div className="muted" style={{ marginTop: 4 }}>Не хватает: {issue.missing}</div>
+
+                  {issue.candidates.length === 0 ? (
+                    <div className="warning-text" style={{ marginTop: 8 }}>
+                      Подходящих кандидатов сейчас нет.
+                    </div>
+                  ) : (
+                    <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
+                      {issue.candidates.map((candidate) => (
+                        <div
+                          key={candidate.employeeId}
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "minmax(220px, 1fr) auto auto",
+                            gap: 10,
+                            alignItems: "center",
+                            padding: "8px 10px",
+                            border: "1px solid var(--border, #ddd)",
+                            borderRadius: 10
+                          }}
+                        >
+                          <div>
+                            <strong>{candidate.fullName}</strong>
+                            <div className="muted">
+                              {candidate.actualHours} / {candidate.targetHours} ч • +{candidate.hours} ч • {candidate.reason}
+                            </div>
+                          </div>
+                          <span className="muted">Недобор: {candidate.deficit} ч</span>
+                          <button
+                            className="primary-button"
+                            onClick={() => applyAssistantCandidate(issue, candidate.employeeId)}
+                          >
+                            Поставить
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
 
       {generationReasons.length > 0 && (
         <section className="card">
@@ -609,7 +724,8 @@ export default function SchedulePage() {
             <h2>Месячная таблица</h2>
             <p className="muted schedule-hint">
               24 — сутки, 12Д — 08:00–20:00, 12Н — 20:00–08:00, 8–17 — дневная смена.
-              «О» означает отпуск, «В» — другое отсутствие. Замены и временное уплотнение показываются в строке фактически назначенного сотрудника.
+              Сначала вручную расставьте базовый график. После этого нажмите «Проверить и помочь закрыть дыры».
+              Ассистент предложит дополнительные смены, но не будет менять уже поставленные вами.
             </p>
           </div>
         </div>
