@@ -25,8 +25,13 @@ function makeEmptySchedule(employees: Employee[], days: number): Schedule {
   );
 }
 
+function isoDate(year: number, month: number, day: number) {
+  const date = new Date(year, month, day);
+  return date.getFullYear() + "-" + String(date.getMonth() + 1).padStart(2, "0") + "-" + String(date.getDate()).padStart(2, "0");
+}
+
 function isEmployeeAvailable(employee: Employee, year: number, month: number, day: number) {
-  const date = String(year) + "-" + String(month + 1).padStart(2, "0") + "-" + String(day).padStart(2, "0");
+  const date = isoDate(year, month, day);
   if (employee.employment_start && date < employee.employment_start) return false;
   if (employee.employment_end && date > employee.employment_end) return false;
   return true;
@@ -187,14 +192,15 @@ export default function SchedulePage() {
     const scheduleId = scheduleInsert.data.id;
 
     const shiftRows = shiftsToCreate.map((item) => {
-      const date = String(year) + "-" + String(month + 1).padStart(2, "0") + "-" + String(item.day).padStart(2, "0");
+      const date = isoDate(year, month, item.day);
+      const endDate = isoDate(year, month, item.day + 1);
       return {
         schedule_id: scheduleId,
         brigade_id: item.brigadeId,
         shift_date: date,
         shift_type: "base",
         start_at: date + "T08:00:00",
-        end_at: date + "T08:00:00",
+        end_at: endDate + "T08:00:00",
         required_hours: 24,
         is_fixed: false,
         is_vacancy: false
