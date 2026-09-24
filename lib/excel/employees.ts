@@ -88,6 +88,24 @@ function parseBoolean(value: unknown): boolean {
   return ["да", "yes", "true", "1", "+", "может"].includes(v);
 }
 
+function isFeldsherPosition(value: unknown): boolean {
+  const position = normalize(value);
+
+  if (!position) return false;
+  if (!position.includes("фельдшер")) return false;
+
+  // Старшие фельдшеры не участвуют в обычном составе наряда.
+  if (
+    position.includes("старш") ||
+    position.includes("ст.фельдшер") ||
+    position.includes("ст. фельдшер")
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 function parseDate(value: unknown): string | null {
   if (!value) return null;
   if (value instanceof Date && !Number.isNaN(value.getTime())) {
@@ -149,9 +167,12 @@ export async function parseEmployeesWorkbook(file: File): Promise<ImportedEmploy
     const fullName = textValue(values[nameCol]);
     if (!fullName) continue;
 
+    const position = positionCol >= 0 ? textValue(values[positionCol]) : "";
+    if (!isFeldsherPosition(position)) continue;
+
     result.push({
       full_name: fullName,
-      position: positionCol >= 0 ? textValue(values[positionCol]) || "Фельдшер" : "Фельдшер",
+      position: position || "Фельдшер",
       main_brigade_number: brigadeCol >= 0 ? parseBrigade(values[brigadeCol]) : null,
       employment_start: startCol >= 0 ? parseDate(values[startCol]) : null,
       employment_end: endCol >= 0 ? parseDate(values[endCol]) : null,
