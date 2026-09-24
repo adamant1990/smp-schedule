@@ -290,26 +290,21 @@ export function generateSchedule(
   // A phase tells us when an employee is available in the normal cycle.
   // It is NOT a reason to create an additional shift. The station still
   // has exactly 13 positions per calendar day.
+  // ДВУХЭТАПНЫЙ ГЕНЕРАТОР:
+  // 1) сначала неизменно строим базовые циклы сотрудников;
+  // 2) затем закрываем только оставшийся дефицит подработками.
   const phaseByEmployee = new Map<string, number>();
 
-  for (const [brigadeId, brigadeEmployees] of byBrigade) {
-    const required = staffing.required.get(brigadeId) ?? 0;
+  for (const [, brigadeEmployees] of byBrigade) {
     const byType = new Map<WorkScheduleType, Employee[]>();
-
     for (const e of brigadeEmployees) {
       const list = byType.get(e.work_schedule_type) ?? [];
       list.push(e);
       byType.set(e.work_schedule_type, list);
     }
-
     for (const [type, list] of byType) {
       list.sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"));
-      list.forEach((e, index) => {
-        const phase = type === "day_night_2_off"
-          ? index % 4
-          : Math.floor(index / Math.max(1, required)) % 4;
-        phaseByEmployee.set(e.id, phase);
-      });
+      list.forEach((e, index) => phaseByEmployee.set(e.id, type === "8_17" ? 0 : index % 4));
     }
   }
 
@@ -317,100 +312,28 @@ export function generateSchedule(
     return cycleLabel(e, day, phaseByEmployee.get(e.id) ?? 0, year, month);
   }
 
-  function assignmentScore(e: Employee, day: number, label: ShiftLabel, brigadeId: string) {
-    const workedMonth = hoursForEmployeeInMonth(e.id, shifts);
-    const target = adjustedMonthlyTarget(e, year, month, absences);
-    const deficit = target - workedMonth;
-    const ratio = target > 0 ? deficit / target : 0;
-
-    // Main-brigade staff are preferred, but workload balancing is stronger
-    // than the brigade preference when the difference in monthly hours is large.
-    const brigadePenalty = e.main_brigade_id === brigadeId ? 0 : 35;
-
-    // The primary criterion is the relative deficit to the monthly norm.
-    // This makes 120/168 preferable to 160/168, rather than simply counting
-    // shifts. Whole shifts may naturally make the final total slightly exceed
-    // the norm.
-    const deficitPriority = Math.max(0, ratio);
-
-    // Prevent the generator from repeatedly choosing the same people.
-    const shiftCount = shifts.filter(s => s.employeeId === e.id).length;
-    const lastWorked = shifts
-      .filter(s => s.employeeId === e.id)
-      .reduce((max, s) => Math.max(max, s.day), 0);
-    const daysSinceLast = lastWorked ? Math.max(0, day - lastWorked) : daysInMonth(year, month) + 1;
-
-    let consecutive = 0;
-    for (let d = day - 1; d >= 1; d--) {
-      if (shifts.some(s => s.employeeId === e.id && s.day === d)) consecutive++;
-      else break;
+  function setCell(employeeId: string, day: number, label: ShiftLabel, kind: ScheduleCell["kind"]) {
+    const current = cells[employeeId][day];
+    if (!current || current.kind === "absence" || !current.label) {
+      cells[employeeId][day] = { label, kind };
+      return;
     }
-
-    const restPreference = -Math.min(daysSinceLast, 6);
-    const consecutivePenalty = consecutive * 8;
-    const surplusPenalty = Math.max(0, -deficit) * (e.can_extra_shifts ? 0.12 : 1.5);
-
-    return brigadePenalty
-      - deficitPriority * 900
-      + surplusPenalty
-      + shiftCount * 1.5
-      + consecutivePenalty
-      + restPreference;
+    const labels = new Set(current.label.split(" + "));
+    labels.add(label);
+    cells[employeeId][day] = { label: Array.from(labels).join(" + "), kind };
   }
 
-  function extraLabels(e: Employee, day: number): ShiftLabel[] {
-    if (!e.can_extra_shifts) return [];
-    const labels: ShiftLabel[] = ["12Д", "12Н", "24"];
-    return labels.filter(label => candidateOK(e, day, label, shifts, year, month, absences, true));
+  function addShift(e: Employee, brigadeId: string, day: number, label: ShiftLabel,
+    shiftType: GeneratedShift["shiftType"], note?: string) {
+    const shift: GeneratedShift = {
+      employeeId: e.id, brigadeId, day, label, hours: shiftHours(label),
+      shiftType, isVacancy: false, note
+    };
+    shifts.push(shift);
+    setCell(e.id, day, label, shiftType === "base" ? "base" : "extra");
+    return shift;
   }
 
-  function chooseCandidate(
-    day: number,
-    brigadeId: string,
-    preferred: Employee[],
-    allowGlobalExtra: boolean
-  ): { e: Employee; label: ShiftLabel } | undefined {
-    const local: { e: Employee; label: ShiftLabel }[] = preferred
-      .map(e => {
-        const label = availableCycleLabel(e, day);
-        return label ? { e, label } : null;
-      })
-      .filter((x): x is { e: Employee; label: ShiftLabel } => x !== null)
-      .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, false))
-      .sort((a, b) => assignmentScore(a.e, day, a.label, brigadeId) - assignmentScore(b.e, day, b.label, brigadeId));
-
-    if (!allowGlobalExtra) return local[0];
-
-    const global: { e: Employee; label: ShiftLabel }[] = employees
-      .filter(e => e.main_brigade_id && e.main_brigade_id !== brigadeId && e.can_extra_shifts)
-      .flatMap(e => {
-        const cycle = availableCycleLabel(e, day);
-        const labels = cycle ? [cycle, ...extraLabels(e, day)] : extraLabels(e, day);
-        return Array.from(new Set(labels)).map(label => ({ e, label }));
-      })
-      .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, true))
-      .sort((a, b) => assignmentScore(a.e, day, a.label, brigadeId) - assignmentScore(b.e, day, b.label, brigadeId));
-
-    // Compare the best employee from the home brigade with the best employee
-    // who can take an extra shift. This is important for brigades with many
-    // employees but only one daily position: otherwise their staff would
-    // remain almost without shifts while other brigades consume all slots.
-    const bestLocal = local[0];
-    const bestGlobal = global[0];
-    if (!bestLocal) return bestGlobal;
-    if (!bestGlobal) return bestLocal;
-
-    return assignmentScore(bestGlobal.e, day, bestGlobal.label!, brigadeId) <
-      assignmentScore(bestLocal.e, day, bestLocal.label!, brigadeId)
-      ? bestGlobal
-      : bestLocal;
-  }
-
-  // Every brigade must be staffed on BOTH periods:
-  // daytime and nighttime. A 24-hour shift covers both periods, while 12Д
-  // covers only daytime and 12Н covers only nighttime. Therefore the generator
-  // fills the two coverage periods independently and never accepts 13/day as
-  // sufficient when the night is short.
   function coversDay(label: ShiftLabel) {
     return label === "24" || label === "12Д" || label === "8–17";
   }
@@ -419,95 +342,148 @@ export function generateSchedule(
     return label === "24" || label === "12Н";
   }
 
-  function choosePeriodCandidate(
-    day: number,
-    brigadeId: string,
-    preferred: Employee[],
-    period: "day" | "night"
-  ): { e: Employee; label: ShiftLabel } | undefined {
-    const allowed = (label: ShiftLabel) =>
-      period === "day" ? coversDay(label) : coversNight(label);
-
-    const local = preferred
-      .flatMap(e => {
-        const cycle = availableCycleLabel(e, day);
-        return cycle && allowed(cycle) ? [{ e, label: cycle }] : [];
-      })
-      .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, false));
-
-    const global = employees
-      .filter(e => e.main_brigade_id && e.main_brigade_id !== brigadeId && e.can_extra_shifts)
-      .flatMap(e => {
-        const cycle = availableCycleLabel(e, day);
-        const labels = cycle && allowed(cycle) ? [cycle, ...extraLabels(e, day).filter(allowed)] : extraLabels(e, day).filter(allowed);
-        return Array.from(new Set(labels)).map(label => ({ e, label }));
-      })
-      .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, true));
-
-    return [...local, ...global]
-      .sort((a, b) => assignmentScore(a.e, day, a.label, brigadeId) - assignmentScore(b.e, day, b.label, brigadeId))[0];
+  function coverageFor(brigadeId: string, day: number) {
+    let dayCount = 0;
+    let nightCount = 0;
+    for (const s of shifts) {
+      if (s.isVacancy || !s.employeeId || s.brigadeId !== brigadeId || s.day !== day) continue;
+      if (coversDay(s.label)) dayCount++;
+      if (coversNight(s.label)) nightCount++;
+    }
+    return { dayCount, nightCount };
   }
 
+  function cycleCandidates(brigadeId: string, day: number) {
+    return (byBrigade.get(brigadeId) ?? [])
+      .map(e => {
+        const label = availableCycleLabel(e, day);
+        return label ? { e, label } : null;
+      })
+      .filter((x): x is { e: Employee; label: ShiftLabel } => x !== null)
+      .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, false))
+      .sort((a, b) => {
+        const ta = adjustedMonthlyTarget(a.e, year, month, absences);
+        const tb = adjustedMonthlyTarget(b.e, year, month, absences);
+        const ha = hoursForEmployeeInMonth(a.e.id, shifts);
+        const hb = hoursForEmployeeInMonth(b.e.id, shifts);
+        const da = ta > 0 ? (ta - ha) / ta : 0;
+        const db = tb > 0 ? (tb - hb) / tb : 0;
+        return db - da;
+      });
+  }
+
+  // ЭТАП 1: только штатный цикл.
   for (let day = 1; day <= days; day++) {
     for (const brigade of staffing.active) {
       const required = staffing.required.get(brigade.id) ?? 0;
-      const brigadeEmployees = byBrigade.get(brigade.id) ?? [];
+      const candidates = cycleCandidates(brigade.id, day);
 
-      for (const period of ["day", "night"] as const) {
-        for (let position = 0; position < required; position++) {
-          const alreadyCovered = shifts.filter(s =>
-            !s.isVacancy &&
-            s.employeeId &&
-            s.brigadeId === brigade.id &&
-            s.day === day &&
-            (period === "day" ? coversDay(s.label) : coversNight(s.label))
-          ).length;
-
-          if (alreadyCovered >= required) continue;
-
-          const selected = choosePeriodCandidate(day, brigade.id, brigadeEmployees, period);
-
-          if (!selected) {
-            // A 24-hour vacancy covers the missing period and can later be
-            // replaced by 24h or by 12Д+12Н in Mode A.
-            const vacancyLabel: ShiftLabel = period === "day" ? "24" : "12Н";
-            shifts.push({
-              employeeId: null,
-              brigadeId: brigade.id,
-              day,
-              label: vacancyLabel,
-              hours: shiftHours(vacancyLabel),
-              shiftType: "base",
-              isVacancy: true,
-              note: "Не найден сотрудник для покрытия " + (period === "day" ? "дневной" : "ночной") + " смены."
-            });
-            continue;
-          }
-
-          const { e, label } = selected;
-          const isBase = e.main_brigade_id === brigade.id;
-
-          shifts.push({
-            employeeId: e.id,
-            brigadeId: brigade.id,
-            day,
-            label,
-            hours: shiftHours(label),
-            shiftType: isBase ? "base" : "replacement",
-            isVacancy: false,
-            note: isBase ? undefined : "Подработка в другой бригаде для равномерного распределения нагрузки."
-          });
-
-          cells[e.id][day] = {
-            label,
-            kind: isBase ? "base" : "extra"
-          };
+      // Сначала 24/3: 24 часа сразу закрывают день и ночь.
+      for (const x of candidates.filter(x => x.label === "24")) {
+        const c = coverageFor(brigade.id, day);
+        if (c.dayCount >= required && c.nightCount >= required) break;
+        if (c.dayCount < required && c.nightCount < required) {
+          addShift(x.e, brigade.id, day, "24", "base");
         }
+      }
+
+      // Затем штатные 12Д / 8–17.
+      for (const x of candidates.filter(x => x.label === "12Д" || x.label === "8–17")) {
+        if (coverageFor(brigade.id, day).dayCount >= required) break;
+        addShift(x.e, brigade.id, day, x.label, "base");
+      }
+
+      // Затем штатные 12Н.
+      for (const x of candidates.filter(x => x.label === "12Н")) {
+        if (coverageFor(brigade.id, day).nightCount >= required) break;
+        addShift(x.e, brigade.id, day, "12Н", "base");
       }
     }
   }
 
+  // ЭТАП 2: только здесь разрешаем подработки.
+  function extraCandidate(brigadeId: string, day: number, label: ShiftLabel) {
+    return employees
+      .filter(e => e.active && e.main_brigade_id && e.can_extra_shifts)
+      .filter(e => candidateOK(e, day, label, shifts, year, month, absences, true))
+      .filter(e => !shifts.some(s => s.employeeId === e.id && s.day === day))
+      .sort((a, b) => {
+        const ta = adjustedMonthlyTarget(a, year, month, absences);
+        const tb = adjustedMonthlyTarget(b, year, month, absences);
+        const ha = hoursForEmployeeInMonth(a.id, shifts);
+        const hb = hoursForEmployeeInMonth(b.id, shifts);
+        const da = ta > 0 ? (ta - ha) / ta : 0;
+        const db = tb > 0 ? (tb - hb) / tb : 0;
+        if (db !== da) return db - da;
+        return (a.main_brigade_id === brigadeId ? 0 : 1) - (b.main_brigade_id === brigadeId ? 0 : 1);
+      })[0];
+  }
+
+  let vacancyCount = 0;
+  let filled = 0;
+
+  for (let day = 1; day <= days; day++) {
+    for (const brigade of staffing.active) {
+      const required = staffing.required.get(brigade.id) ?? 0;
+
+      for (let guard = 0; guard < required * 4; guard++) {
+        const c = coverageFor(brigade.id, day);
+        const dayMissing = required - c.dayCount;
+        const nightMissing = required - c.nightCount;
+        if (dayMissing <= 0 && nightMissing <= 0) break;
+
+        // Если одновременно не хватает дня и ночи — одна 24-часовая подработка.
+        if (dayMissing > 0 && nightMissing > 0) {
+          const e24 = extraCandidate(brigade.id, day, "24");
+          if (e24) {
+            addShift(e24, brigade.id, day, "24",
+              mode === "B" ? "temporary_densification" : "replacement",
+              "Этап 2: дополнительная 24-часовая смена.");
+            filled++;
+            continue;
+          }
+        }
+
+        // Только день — 12Д.
+        if (dayMissing > 0) {
+          const e12d = extraCandidate(brigade.id, day, "12Д");
+          if (e12d) {
+            addShift(e12d, brigade.id, day, "12Д",
+              mode === "B" ? "temporary_densification" : "replacement",
+              "Этап 2: дополнительная дневная смена.");
+            filled++;
+            continue;
+          }
+        }
+
+        // Только ночь — 12Н.
+        if (nightMissing > 0) {
+          const e12n = extraCandidate(brigade.id, day, "12Н");
+          if (e12n) {
+            addShift(e12n, brigade.id, day, "12Н",
+              mode === "B" ? "temporary_densification" : "replacement",
+              "Этап 2: дополнительная ночная смена.");
+            filled++;
+            continue;
+          }
+        }
+
+        break;
+      }
+
+      const c = coverageFor(brigade.id, day);
+      const remaining = Math.max(0, required - c.dayCount) + Math.max(0, required - c.nightCount);
+      if (remaining > 0) {
+        vacancyCount += remaining;
+        reasons.push(dateOf(year, month, day) + ": бригада " + brigade.number +
+          " не закрыта после двух этапов. Осталось мест: " + remaining + ".");
+      }
+    }
+  }
+
+  // Для совместимости с остальной частью движка оставляем этот массив.
   const vacancies = shifts.filter(s => s.isVacancy);
+
   let filled = 0;
 
   // Close vacancies created by absences or by a shortage in the base cycle.
