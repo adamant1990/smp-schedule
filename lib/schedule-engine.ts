@@ -115,6 +115,12 @@ function hoursForEmployeeInWeek(
     .reduce((sum, s) => sum + s.hours, 0);
 }
 
+function hoursForEmployeeInMonth(employeeId: string, shifts: GeneratedShift[]) {
+  return shifts
+    .filter(s => s.employeeId === employeeId)
+    .reduce((sum, s) => sum + s.hours, 0);
+}
+
 function staffingRequirements(brigades: Brigade[]) {
   const active = brigades.filter(b => b.active).sort((a, b) => a.number - b.number);
   if (active.length !== 8) {
@@ -196,14 +202,15 @@ export function generateSchedule(
   }
   for (const list of byBrigade.values()) list.sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"));
 
-  // Build exactly the required number of base positions for every brigade/day.
-  // A work cycle describes when an employee is available for his/her base shift;
-  // it must not create extra positions beyond the 13 positions required by the station.
+  // A phase tells us when an employee is available in the normal cycle.
+  // It is NOT a reason to create an additional shift. The station still
+  // has exactly 13 positions per calendar day.
   const phaseByEmployee = new Map<string, number>();
 
   for (const [brigadeId, brigadeEmployees] of byBrigade) {
     const required = staffing.required.get(brigadeId) ?? 0;
     const byType = new Map<WorkScheduleType, Employee[]>();
+
     for (const e of brigadeEmployees) {
       const list = byType.get(e.work_schedule_type) ?? [];
       list.push(e);
@@ -213,10 +220,6 @@ export function generateSchedule(
     for (const [type, list] of byType) {
       list.sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"));
       list.forEach((e, index) => {
-        // 24-hour crews need identical phases in pairs so 2-person brigades
-        // can be staffed on the same 24-hour days.
-        // 12-hour crews must be phased as day/night/off/off so a 2-person
-        // brigade has one day worker and one night worker every calendar day.
         const phase = type === "day_night_2_off"
           ? index % 4
           : Math.floor(index / Math.max(1, required)) % 4;
@@ -225,62 +228,65 @@ export function generateSchedule(
     }
   }
 
+  function availableCycleLabel(e: Employee, day: number) {
+    return cycleLabel(e, day, phaseByEmployee.get(e.id) ?? 0, year, month);
+  }
+
+  function assignmentScore(e: Employee, day: number, label: ShiftLabel, brigadeId: string) {
+    const workedMonth = hoursForEmployeeInMonth(e.id, shifts);
+    const target = Math.max(0, e.target_hours || 0);
+    const deficit = target - workedMonth;
+
+    // Strongly prefer the employee's main brigade for a base position.
+    // When the main brigade has more available staff than its daily quota,
+    // extra-capable employees can cover positions in other brigades.
+    const brigadePenalty = e.main_brigade_id === brigadeId ? 0 : 1000;
+
+    // Lower current workload wins. This prevents alphabetical ordering from
+    // giving the same few people all available cycle days.
+    return brigadePenalty - deficit * 10 + workedMonth / 1000 + day / 100000;
+  }
+
+  function chooseCandidate(
+    day: number,
+    brigadeId: string,
+    preferred: Employee[],
+    allowGlobalExtra: boolean
+  ) {
+    const local = preferred
+      .map(e => ({ e, label: availableCycleLabel(e, day) }))
+      .filter(x => x.label !== null)
+      .filter(x => candidateOK(x.e, day, x.label!, shifts, year, month, absences, false))
+      .sort((a, b) => assignmentScore(a.e, day, a.label!, brigadeId) - assignmentScore(b.e, day, b.label!, brigadeId));
+
+    if (local.length > 0) return local[0];
+
+    if (!allowGlobalExtra) return undefined;
+
+    const global = employees
+      .filter(e => e.main_brigade_id && e.main_brigade_id !== brigadeId && e.can_extra_shifts)
+      .map(e => ({ e, label: availableCycleLabel(e, day) }))
+      .filter(x => x.label !== null)
+      .filter(x => candidateOK(x.e, day, x.label!, shifts, year, month, absences, true))
+      .sort((a, b) => assignmentScore(a.e, day, a.label!, brigadeId) - assignmentScore(b.e, day, b.label!, brigadeId));
+
+    return global[0];
+  }
+
+  // Fill exactly 13 positions every day. First use employees in their own
+  // brigade according to their cycle and current workload. If that brigade
+  // has more cycle-available employees than its quota, an extra-capable
+  // employee may be assigned to another brigade so the whole staff gets a
+  // fair share of the monthly work.
   for (let day = 1; day <= days; day++) {
     for (const brigade of staffing.active) {
       const required = staffing.required.get(brigade.id) ?? 0;
       const brigadeEmployees = byBrigade.get(brigade.id) ?? [];
 
-      const candidates = brigadeEmployees
-        .filter(e => e.active && e.main_brigade_id === brigade.id && employed(e, year, month, day))
-        .map(e => ({
-          e,
-          label: cycleLabel(e, day, phaseByEmployee.get(e.id) ?? 0, year, month)
-        }))
-        .filter(x => x.label !== null)
-        .filter(x => {
-          const used = hoursForEmployeeInWeek(x.e.id, shifts, year, month, weekKey(year, month, day));
-          return used + shiftHours(x.label!) <= 48;
-        })
-        .sort((a, b) => {
-          const aAbsent = absent(a.e, year, month, day, absences) ? 1 : 0;
-          const bAbsent = absent(b.e, year, month, day, absences) ? 1 : 0;
-          if (aAbsent !== bAbsent) return aAbsent - bAbsent;
-          return a.e.full_name.localeCompare(b.e.full_name, "ru");
-        });
+      for (let position = 0; position < required; position++) {
+        const selected = chooseCandidate(day, brigade.id, brigadeEmployees, true);
 
-      const selected = candidates.slice(0, required);
-
-      for (const { e, label } of selected) {
-        const shift: GeneratedShift = {
-          employeeId: null,
-          sourceEmployeeId: e.id,
-          brigadeId: brigade.id,
-          day,
-          label: label!,
-          hours: shiftHours(label!),
-          shiftType: "base",
-          isVacancy: true
-        };
-
-        if (absent(e, year, month, day, absences)) {
-          shift.note = "Основная смена сохранена как вакансия из-за отсутствия.";
-          cells[e.id][day] = { label: "В", kind: "absence" };
-        } else {
-          shift.employeeId = e.id;
-          shift.isVacancy = false;
-          delete shift.sourceEmployeeId;
-          delete shift.note;
-          cells[e.id][day] = { label: label!, kind: "base" };
-        }
-
-        shifts.push(shift);
-      }
-
-      // If the cycle cannot provide enough people, create explicit vacancies.
-      // These are then handled by the replacement logic below.
-      if (selected.length < required) {
-        const missing = required - selected.length;
-        for (let i = 0; i < missing; i++) {
+        if (!selected) {
           shifts.push({
             employeeId: null,
             brigadeId: brigade.id,
@@ -289,9 +295,46 @@ export function generateSchedule(
             hours: 24,
             shiftType: "base",
             isVacancy: true,
-            note: "Не найден сотрудник в основном цикле."
+            note: "Не найден сотрудник в основном цикле или среди сотрудников, которым разрешены подработки."
           });
+          continue;
         }
+
+        const { e, label } = selected;
+        const isBase = e.main_brigade_id === brigade.id;
+        const isAbsent = absent(e, year, month, day, absences);
+
+        if (isAbsent) {
+          shifts.push({
+            employeeId: null,
+            brigadeId: brigade.id,
+            day,
+            label,
+            hours: shiftHours(label),
+            shiftType: "base",
+            isVacancy: true,
+            sourceEmployeeId: e.id,
+            note: "Основная смена сохранена как вакансия из-за отсутствия."
+          });
+          cells[e.id][day] = { label: "В", kind: "absence" };
+          continue;
+        }
+
+        shifts.push({
+          employeeId: e.id,
+          brigadeId: brigade.id,
+          day,
+          label,
+          hours: shiftHours(label),
+          shiftType: isBase ? "base" : "replacement",
+          isVacancy: false,
+          note: isBase ? undefined : "Подработка в другой бригаде для равномерного распределения нагрузки."
+        });
+
+        cells[e.id][day] = {
+          label,
+          kind: isBase ? "base" : "extra"
+        };
       }
     }
   }
@@ -299,49 +342,58 @@ export function generateSchedule(
   const vacancies = shifts.filter(s => s.isVacancy);
   let filled = 0;
 
+  // Close vacancies created by absences or by a shortage in the base cycle.
   for (const vacancy of vacancies) {
     const active = shifts.filter(s => !s.isVacancy);
     let replacement: Employee | undefined;
     let label = vacancy.label;
     let shiftType: GeneratedShift["shiftType"] = "replacement";
-    let brigadeId = vacancy.brigadeId;
+    const brigadeId = vacancy.brigadeId;
 
     if (mode === "A") {
-      // Mode A: first try a 24-hour employee for a 24-hour vacancy.
-      if (vacancy.label === "24") {
-        replacement = employees
-          .filter(e => e.work_schedule_type === "24/3" && e.main_brigade_id === vacancy.brigadeId)
-          .filter(e => candidateOK(e, vacancy.day, "24", active, year, month, absences, true))
-          .sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"))[0];
+      const sameBrigade = employees
+        .filter(e => e.main_brigade_id === brigadeId && e.can_extra_shifts)
+        .filter(e => candidateOK(e, vacancy.day, vacancy.label, active, year, month, absences, true))
+        .sort((a, b) => assignmentScore(a, vacancy.day, vacancy.label, brigadeId) - assignmentScore(b, vacancy.day, vacancy.label, brigadeId));
 
-        if (replacement) label = "24";
-      } else {
-        replacement = employees
-          .filter(e => e.work_schedule_type === "day_night_2_off" && e.main_brigade_id === vacancy.brigadeId)
-          .filter(e => candidateOK(e, vacancy.day, vacancy.label, active, year, month, absences, true))
-          .sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"))[0];
-      }
+      replacement = sameBrigade[0];
 
-      // A 24-hour vacancy can also be split into 08-20 + 20-08.
       if (!replacement && vacancy.label === "24") {
         const dayCandidates = employees
-          .filter(e => e.main_brigade_id === vacancy.brigadeId)
-          .filter(e => candidateOK(e, vacancy.day, "12Д", active, year, month, absences, true));
+          .filter(e => e.main_brigade_id === brigadeId && e.can_extra_shifts)
+          .filter(e => candidateOK(e, vacancy.day, "12Д", active, year, month, absences, true))
+          .sort((a, b) => assignmentScore(a, vacancy.day, "12Д", brigadeId) - assignmentScore(b, vacancy.day, "12Д", brigadeId));
+
         const nightCandidates = employees
-          .filter(e => e.main_brigade_id === vacancy.brigadeId)
-          .filter(e => candidateOK(e, vacancy.day, "12Н", active, year, month, absences, true));
+          .filter(e => e.main_brigade_id === brigadeId && e.can_extra_shifts)
+          .filter(e => candidateOK(e, vacancy.day, "12Н", active, year, month, absences, true))
+          .sort((a, b) => assignmentScore(a, vacancy.day, "12Н", brigadeId) - assignmentScore(b, vacancy.day, "12Н", brigadeId));
+
         const dayEmployee = dayCandidates[0];
         const nightEmployee = nightCandidates.find(e => e.id !== dayEmployee?.id);
+
         if (dayEmployee && nightEmployee) {
           shifts.push({
-            employeeId: dayEmployee.id, brigadeId: brigadeId, day: vacancy.day,
-            label: "12Д", hours: 12, shiftType: "replacement", isVacancy: false,
-            sourceEmployeeId: vacancy.sourceEmployeeId, note: "Часть 24-часовой вакансии."
+            employeeId: dayEmployee.id,
+            brigadeId,
+            day: vacancy.day,
+            label: "12Д",
+            hours: 12,
+            shiftType: "replacement",
+            isVacancy: false,
+            sourceEmployeeId: vacancy.sourceEmployeeId,
+            note: "Часть 24-часовой вакансии."
           });
           shifts.push({
-            employeeId: nightEmployee.id, brigadeId: brigadeId, day: vacancy.day,
-            label: "12Н", hours: 12, shiftType: "replacement", isVacancy: false,
-            sourceEmployeeId: vacancy.sourceEmployeeId, note: "Часть 24-часовой вакансии."
+            employeeId: nightEmployee.id,
+            brigadeId,
+            day: vacancy.day,
+            label: "12Н",
+            hours: 12,
+            shiftType: "replacement",
+            isVacancy: false,
+            sourceEmployeeId: vacancy.sourceEmployeeId,
+            note: "Часть 24-часовой вакансии."
           });
           cells[dayEmployee.id][vacancy.day] = { label: "12Д", kind: "replacement" };
           cells[nightEmployee.id][vacancy.day] = { label: "12Н", kind: "replacement" };
@@ -350,43 +402,39 @@ export function generateSchedule(
         }
       }
     } else {
-      // Mode B: temporary densification starts inside the absent employee's brigade.
       replacement = employees
-        .filter(e => e.main_brigade_id === vacancy.brigadeId)
+        .filter(e => e.main_brigade_id === brigadeId && e.can_extra_shifts)
         .filter(e => candidateOK(e, vacancy.day, vacancy.label, active, year, month, absences, true))
-        .sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"))[0];
+        .sort((a, b) => assignmentScore(a, vacancy.day, vacancy.label, brigadeId) - assignmentScore(b, vacancy.day, vacancy.label, brigadeId))[0];
 
-      if (replacement) {
-        shiftType = "temporary_densification";
-      } else {
-        // If the brigade cannot cover the vacancy, use another brigade.
+      if (replacement) shiftType = "temporary_densification";
+
+      if (!replacement) {
         replacement = employees
-          .filter(e => e.main_brigade_id && e.main_brigade_id !== vacancy.brigadeId)
+          .filter(e => e.main_brigade_id && e.main_brigade_id !== brigadeId && e.can_extra_shifts)
           .filter(e => candidateOK(e, vacancy.day, vacancy.label, active, year, month, absences, true))
-          .sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"))[0];
-      }
-    }
-
-    if (replacement) {
-      // Never allow an automatic replacement to push the employee above 48 hours
-      // in the same calendar week.
-      const targetWeek = weekKey(year, month, vacancy.day);
-      const alreadyWorked = hoursForEmployeeInWeek(replacement.id, shifts, year, month, targetWeek);
-      if (alreadyWorked + shiftHours(label) > 48) {
-        replacement = undefined;
+          .sort((a, b) => assignmentScore(a, vacancy.day, vacancy.label, brigadeId) - assignmentScore(b, vacancy.day, vacancy.label, brigadeId))[0];
       }
     }
 
     if (replacement) {
       shifts.push({
-        employeeId: replacement.id, brigadeId, day: vacancy.day, label,
-        hours: shiftHours(label), shiftType, isVacancy: false,
+        employeeId: replacement.id,
+        brigadeId,
+        day: vacancy.day,
+        label,
+        hours: shiftHours(label),
+        shiftType,
+        isVacancy: false,
         sourceEmployeeId: vacancy.sourceEmployeeId,
         note: mode === "B" && shiftType === "temporary_densification"
           ? "Режим B: временное уплотнение; после возвращения сотрудника прекращается."
           : "Автоматическая замена вакансии."
       });
-      cells[replacement.id][vacancy.day] = { label, kind: shiftType === "temporary_densification" ? "extra" : "replacement" };
+      cells[replacement.id][vacancy.day] = {
+        label,
+        kind: shiftType === "temporary_densification" ? "extra" : "replacement"
+      };
       filled++;
     } else {
       reasons.push(
@@ -397,7 +445,6 @@ export function generateSchedule(
     }
   }
 
-  // Final hard check: no employee may exceed 48 hours in a calendar week.
   const weeklyHours = new Map<string, number>();
   for (const shift of shifts) {
     if (!shift.employeeId) continue;
@@ -418,10 +465,12 @@ export function generateSchedule(
       finalBrigadeCounts.set(shift.day, byDay);
     }
   }
+
   let staffingValid = true;
   for (let day = 1; day <= days; day++) {
     const count = finalDailyCounts.get(day) ?? 0;
     const brigadeCounts = finalBrigadeCounts.get(day) ?? new Map<string, number>();
+
     if (count !== 13) {
       staffingValid = false;
       reasons.push(
@@ -430,6 +479,7 @@ export function generateSchedule(
         " фельдшеров вместо 13."
       );
     }
+
     for (const [brigadeId, required] of staffing.required) {
       const actual = brigadeCounts.get(brigadeId) ?? 0;
       if (actual !== required) {
@@ -443,6 +493,7 @@ export function generateSchedule(
       }
     }
   }
+
   if ([...weeklyHours.values()].some(hours => hours > 48)) staffingValid = false;
   if (vacancies.length - filled > 0) staffingValid = false;
 
