@@ -359,21 +359,36 @@ export function generateSchedule(
   }
 
   const finalDailyCounts = new Map<number, number>();
+  const finalBrigadeCounts = new Map<number, Map<string, number>>();
   for (const shift of shifts) {
     if (!shift.isVacancy && shift.employeeId) {
       finalDailyCounts.set(shift.day, (finalDailyCounts.get(shift.day) ?? 0) + 1);
+      const byDay = finalBrigadeCounts.get(shift.day) ?? new Map<string, number>();
+      byDay.set(shift.brigadeId, (byDay.get(shift.brigadeId) ?? 0) + 1);
+      finalBrigadeCounts.set(shift.day, byDay);
     }
   }
   let staffingValid = true;
   for (let day = 1; day <= days; day++) {
     const count = finalDailyCounts.get(day) ?? 0;
+    const brigadeCounts = finalBrigadeCounts.get(day) ?? new Map<string, number>();
     if (count !== 13) {
       staffingValid = false;
-      if (!reasons.some(r => r.includes(dateOf(year, month, day) + " итоговая укомплектованность"))) {
+      reasons.push(
+        dateOf(year, month, day) +
+        " итоговая укомплектованность: " + count +
+        " фельдшеров вместо 13."
+      );
+    }
+    for (const [brigadeId, required] of staffing.required) {
+      const actual = brigadeCounts.get(brigadeId) ?? 0;
+      if (actual !== required) {
+        staffingValid = false;
+        const brigadeNumber = brigades.find(b => b.id === brigadeId)?.number ?? brigadeId;
         reasons.push(
           dateOf(year, month, day) +
-          " итоговая укомплектованность: " + count +
-          " фельдшеров вместо 13."
+          " бригада " + brigadeNumber +
+          ": " + actual + " фельдшеров вместо " + required + "."
         );
       }
     }
