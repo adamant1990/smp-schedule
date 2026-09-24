@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import ExcelJS from "exceljs";
 import { createClient } from "@/lib/supabase/client";
 import {
@@ -352,7 +352,7 @@ export default function SchedulePage() {
     }
   }
 
-  function handleExcelFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+  function handleExcelFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (file) void importExcelSchedule(file);
   }
@@ -690,7 +690,7 @@ export default function SchedulePage() {
           <input
             ref={fileInputRef}
             type="file"
-            accept=".xlsx,.xls"
+            accept=".xlsx"
             onChange={handleExcelFileChange}
             style={{ display: "none" }}
           />
