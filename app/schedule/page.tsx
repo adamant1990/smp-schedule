@@ -159,7 +159,7 @@ export default function SchedulePage() {
     const supabase = createClient();
     const result = await supabase.from("employee_absences").insert({
       employee_id: employee.id,
-      absence_type: "отпуск",
+      absence_type: "vacation",
       date_from: vacationFrom,
       date_to: vacationTo,
     }).select("id, employee_id, absence_type, date_from, date_to").single();
