@@ -393,13 +393,33 @@ export function generateSchedule(
       .filter((x): x is { e: Employee; label: ShiftLabel } => x !== null)
       .filter(x => candidateOK(x.e, day, x.label, shifts, year, month, absences, false))
       .sort((a, b) => {
+        // На первом этапе важнее всего не дать одному сотруднику
+        // забрать все одинаковые циклические места. Сначала смотрим
+        // относительный недобор часов, затем фактические часы, затем
+        // количество уже назначенных базовых смен и только потом имя.
         const ta = adjustedMonthlyTarget(a.e, year, month, absences);
         const tb = adjustedMonthlyTarget(b.e, year, month, absences);
         const ha = hoursForEmployeeInMonth(a.e.id, shifts);
         const hb = hoursForEmployeeInMonth(b.e.id, shifts);
         const da = ta > 0 ? (ta - ha) / ta : 0;
         const db = tb > 0 ? (tb - hb) / tb : 0;
-        return db - da;
+        if (Math.abs(db - da) > 0.0001) return db - da;
+
+        if (ha !== hb) return ha - hb;
+
+        const ba = shifts.filter(s => s.employeeId === a.e.id && s.shiftType === "base").length;
+        const bb = shifts.filter(s => s.employeeId === b.e.id && s.shiftType === "base").length;
+        if (ba !== bb) return ba - bb;
+
+        const lastA = shifts
+          .filter(s => s.employeeId === a.e.id && s.shiftType === "base")
+          .reduce((max, s) => Math.max(max, s.day), 0);
+        const lastB = shifts
+          .filter(s => s.employeeId === b.e.id && s.shiftType === "base")
+          .reduce((max, s) => Math.max(max, s.day), 0);
+        if (lastA !== lastB) return lastA - lastB;
+
+        return a.e.full_name.localeCompare(b.e.full_name, "ru");
       });
   }
 
@@ -445,8 +465,29 @@ export function generateSchedule(
         const hb = hoursForEmployeeInMonth(b.id, shifts);
         const da = ta > 0 ? (ta - ha) / ta : 0;
         const db = tb > 0 ? (tb - hb) / tb : 0;
-        if (db !== da) return db - da;
-        return (a.main_brigade_id === brigadeId ? 0 : 1) - (b.main_brigade_id === brigadeId ? 0 : 1);
+
+        // Этап 2 — это выравнивание. Поэтому приоритет получает тот,
+        // у кого относительно нормы больше недобор.
+        if (Math.abs(db - da) > 0.0001) return db - da;
+        if (ha !== hb) return ha - hb;
+
+        const ca = shifts.filter(s => s.employeeId === a.id).length;
+        const cb = shifts.filter(s => s.employeeId === b.id).length;
+        if (ca !== cb) return ca - cb;
+
+        const sameA = a.main_brigade_id === brigadeId ? 0 : 1;
+        const sameB = b.main_brigade_id === brigadeId ? 0 : 1;
+        if (sameA !== sameB) return sameA - sameB;
+
+        const lastA = shifts
+          .filter(s => s.employeeId === a.id)
+          .reduce((max, s) => Math.max(max, s.day), 0);
+        const lastB = shifts
+          .filter(s => s.employeeId === b.id)
+          .reduce((max, s) => Math.max(max, s.day), 0);
+        if (lastA !== lastB) return lastA - lastB;
+
+        return a.full_name.localeCompare(b.full_name, "ru");
       })[0];
   }
 
@@ -620,67 +661,11 @@ export function generateSchedule(
     }
   }
 
-  // Second pass: rebalance the already valid daily staffing toward monthly
-  // norms. A move never changes the number of positions in a brigade/day.
-  // It is accepted only when the receiving employee can legally work the shift
-  // and the donor is above the receiving employee's relative workload.
-  for (let pass = 0; pass < 250; pass++) {
-    let moved = false;
-
-    for (const current of [...shifts]) {
-      // Базовый цикл после этапа 1 не трогаем. Иначе перераспределение
-      // могло бы превратить 24/3 или день/ночь/2 выходных в произвольный график.
-      if (current.isVacancy || !current.employeeId || current.shiftType === "base") continue;
-
-      const donor = employees.find(e => e.id === current.employeeId);
-      if (!donor) continue;
-
-      const donorTarget = adjustedMonthlyTarget(donor, year, month, absences);
-      const donorHours = hoursForEmployeeInMonth(donor.id, shifts);
-      if (donorHours <= donorTarget) continue;
-
-      const receivers = employees
-        .filter(e => e.id !== donor.id && e.active && e.main_brigade_id)
-        .filter(e => {
-          const target = adjustedMonthlyTarget(e, year, month, absences);
-          const hours = hoursForEmployeeInMonth(e.id, shifts);
-          return target > 0 && hours + current.hours < target;
-        })
-        .filter(e => {
-          // Temporarily remove the donor shift while testing the receiver.
-          const idx = shifts.indexOf(current);
-          if (idx >= 0) shifts.splice(idx, 1);
-          const ok = candidateOK(e, current.day, current.label, shifts, year, month, absences, false);
-          if (idx >= 0) shifts.splice(idx, 0, current);
-          return ok;
-        })
-        .sort((a, b) => {
-          const ta = adjustedMonthlyTarget(a, year, month, absences);
-          const tb = adjustedMonthlyTarget(b, year, month, absences);
-          const ha = hoursForEmployeeInMonth(a.id, shifts);
-          const hb = hoursForEmployeeInMonth(b.id, shifts);
-          return (tb - hb) / tb - (ta - ha) / ta;
-        });
-
-      const receiver = receivers[0];
-      if (!receiver) continue;
-
-      // Do not move a shift when it would make the donor fall below norm.
-      if (donorHours - current.hours < donorTarget) continue;
-
-      current.employeeId = receiver.id;
-      current.shiftType = receiver.main_brigade_id === current.brigadeId ? "base" : "replacement";
-      current.note = "Перераспределено вторым проходом по месячной норме часов.";
-      cells[donor.id][current.day] = { label: "", kind: "base" };
-      cells[receiver.id][current.day] = {
-        label: current.label,
-        kind: current.shiftType === "base" ? "base" : "extra"
-      };
-      moved = true;
-    }
-
-    if (!moved) break;
-  }
+  // После этапа 2 ничего не переносим между сотрудниками.
+  // Базовый цикл остаётся неизменным, а дополнительные смены уже
+  // распределены по относительному недобору часов. Такой порядок
+  // делает график стабильным от запуска к запуску и не отнимает
+  // базовую смену у одного сотрудника ради другого.
 
   // target_hours is a MONTHLY norm. It is not a weekly maximum.
   // A non-extra employee must receive at least the monthly norm, but whole
@@ -808,7 +793,7 @@ export function generateSchedule(
     cells,
     vacancyCount: vacancyCount,
     filledVacancyCount: filled,
-    unfilledVacancyCount: vacancyCount,
+    unfilledVacancyCount: Math.max(0, vacancyCount - filled),
     staffingValid,
     reasons
   };
