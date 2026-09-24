@@ -28,6 +28,11 @@ function findColumn(headers: string[], variants: string[]): number {
   );
 }
 
+function getRowValues(row: ExcelJS.Row): unknown[] {
+  const values = row.values;
+  return Array.isArray(values) ? values.slice(1) : [];
+}
+
 function parseBrigade(value: unknown): number | null {
   const match = textValue(value).match(/(?:бр\.?\s*)?(?:бригада\s*)?(\d{1,2})/i);
   const number = match ? Number(match[1]) : Number(textValue(value));
@@ -70,7 +75,7 @@ export async function parseEmployeesWorkbook(file: File): Promise<ImportedEmploy
   if (!sheet) throw new Error("В Excel-файле нет листов.");
 
   const headerRow = sheet.getRow(1);
-  const headers = headerRow.values.slice(1).map((value) => textValue(value));
+  const headers = getRowValues(headerRow).map((value) => textValue(value));
 
   const nameCol = findColumn(headers, ["ФИО", "Ф. И. О.", "Фамилия Имя Отчество", "Полное ФИО", "Сотрудник"]);
   if (nameCol < 0) throw new Error("Не найден столбец «ФИО».");
@@ -86,7 +91,7 @@ export async function parseEmployeesWorkbook(file: File): Promise<ImportedEmploy
 
   for (let rowNumber = 2; rowNumber <= sheet.rowCount; rowNumber += 1) {
     const row = sheet.getRow(rowNumber);
-    const values = row.values.slice(1) as unknown[];
+    const values = getRowValues(row);
     const fullName = textValue(values[nameCol]);
     if (!fullName) continue;
 
