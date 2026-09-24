@@ -33,6 +33,50 @@ function getRowValues(row: ExcelJS.Row): unknown[] {
   return Array.isArray(values) ? values.slice(1) : [];
 }
 
+function getMergedCellValue(sheet: ExcelJS.Worksheet, row: number, column: number): string {
+  const cell = sheet.getCell(row, column);
+  return textValue(cell.value);
+}
+
+function buildHeaderValues(sheet: ExcelJS.Worksheet, rowNumber: number): string[] {
+  const row = sheet.getRow(rowNumber);
+  const values = getRowValues(row).map((value) => textValue(value));
+
+  for (let column = 1; column <= sheet.columnCount; column += 1) {
+    if (values[column - 1]) continue;
+
+    const cell = sheet.getCell(rowNumber, column);
+    const master = cell.master;
+    if (master && master.address !== cell.address) {
+      values[column - 1] = textValue(master.value);
+    }
+  }
+
+  return values;
+}
+
+function findHeaderRow(sheet: ExcelJS.Worksheet): { rowNumber: number; headers: string[] } {
+  const variants = [
+    "ФИО",
+    "Ф. И. О.",
+    "Фамилия Имя Отчество",
+    "Полное ФИО",
+    "Сотрудник"
+  ].map(normalize);
+
+  const maxRowsToScan = Math.min(sheet.rowCount, 30);
+
+  for (let rowNumber = 1; rowNumber <= maxRowsToScan; rowNumber += 1) {
+    const headers = buildHeaderValues(sheet, rowNumber);
+    const hasNameHeader = headers.some((header) => variants.includes(normalize(header)));
+    if (hasNameHeader) {
+      return { rowNumber, headers };
+    }
+  }
+
+  throw new Error("Не найден столбец «ФИО». Заголовок должен содержать «ФИО».");
+}
+
 function parseBrigade(value: unknown): number | null {
   const match = textValue(value).match(/(?:бр\.?\s*)?(?:бригада\s*)?(\d{1,2})/i);
   const number = match ? Number(match[1]) : Number(textValue(value));
@@ -74,10 +118,15 @@ export async function parseEmployeesWorkbook(file: File): Promise<ImportedEmploy
   const sheet = workbook.worksheets[0];
   if (!sheet) throw new Error("В Excel-файле нет листов.");
 
-  const headerRow = sheet.getRow(1);
-  const headers = getRowValues(headerRow).map((value) => textValue(value));
+  const { rowNumber: headerRowNumber, headers } = findHeaderRow(sheet);
 
-  const nameCol = findColumn(headers, ["ФИО", "Ф. И. О.", "Фамилия Имя Отчество", "Полное ФИО", "Сотрудник"]);
+  const nameCol = findColumn(headers, [
+    "ФИО",
+    "Ф. И. О.",
+    "Фамилия Имя Отчество",
+    "Полное ФИО",
+    "Сотрудник"
+  ]);
   if (nameCol < 0) throw new Error("Не найден столбец «ФИО».");
 
   const positionCol = findColumn(headers, ["Должность", "Позиция"]);
@@ -85,11 +134,16 @@ export async function parseEmployeesWorkbook(file: File): Promise<ImportedEmploy
   const startCol = findColumn(headers, ["Дата начала", "Начало работы", "Дата приема"]);
   const endCol = findColumn(headers, ["Дата окончания", "Окончание работы"]);
   const hoursCol = findColumn(headers, ["Норма часов", "Часы", "Целевые часы", "Target hours"]);
-  const extraCol = findColumn(headers, ["Дополнительные смены", "Подработка", "Может брать дополнительные", "Доп. смены"]);
+  const extraCol = findColumn(headers, [
+    "Дополнительные смены",
+    "Подработка",
+    "Может брать дополнительные",
+    "Доп. смены"
+  ]);
 
   const result: ImportedEmployee[] = [];
 
-  for (let rowNumber = 2; rowNumber <= sheet.rowCount; rowNumber += 1) {
+  for (let rowNumber = headerRowNumber + 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
     const row = sheet.getRow(rowNumber);
     const values = getRowValues(row);
     const fullName = textValue(values[nameCol]);
