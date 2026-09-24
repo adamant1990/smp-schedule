@@ -4,16 +4,23 @@ import { FormEvent, useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 
 type Brigade = { id:string; number:number; name:string; active:boolean };
+type WorkScheduleType = "24/3" | "day_night_2_off" | "8_17";
 type Employee = {
   id:string; full_name:string; position:string; main_brigade_id:string|null;
   employment_start:string|null; employment_end:string|null;
-  target_hours:number; can_extra_shifts:boolean; active:boolean;
+  target_hours:number; can_extra_shifts:boolean; work_schedule_type:WorkScheduleType; active:boolean;
 };
 
 const emptyForm = {
   full_name:"", position:"Фельдшер", main_brigade_id:"",
   employment_start:"", employment_end:"", target_hours:"0",
-  can_extra_shifts:true
+  can_extra_shifts:true, work_schedule_type:"24/3" as WorkScheduleType
+};
+
+const scheduleTypeLabel: Record<WorkScheduleType,string> = {
+  "24/3":"24 часа / 3 выходных",
+  day_night_2_off:"День 08–20 / ночь 20–08 / 2 выходных",
+  "8_17":"08:00–17:00"
 };
 
 export default function EmployeesPage() {
@@ -46,7 +53,8 @@ export default function EmployeesPage() {
       employment_start:employee.employment_start || "",
       employment_end:employee.employment_end || "",
       target_hours:String(employee.target_hours ?? 0),
-      can_extra_shifts:employee.can_extra_shifts
+      can_extra_shifts:employee.can_extra_shifts,
+      work_schedule_type:employee.work_schedule_type || "24/3"
     });
     window.scrollTo({top:0,behavior:"smooth"});
   }
@@ -62,7 +70,9 @@ export default function EmployeesPage() {
       employment_start:form.employment_start || null,
       employment_end:form.employment_end || null,
       target_hours:Number(form.target_hours) || 0,
-      can_extra_shifts:form.can_extra_shifts, active:true
+      can_extra_shifts:form.can_extra_shifts,
+      work_schedule_type:form.work_schedule_type,
+      active:true
     };
     const result=editing
       ? await supabase.from("employees").update(payload).eq("id",editing)
@@ -82,7 +92,7 @@ export default function EmployeesPage() {
   return (
     <main className="page">
       <header className="topbar">
-        <div><div className="eyebrow">СМП • ПЛАНИРОВАНИЕ</div><h1>Сотрудники</h1><p className="muted">Сотрудники, основные бригады и нормы часов.</p></div>
+        <div><div className="eyebrow">СМП • ПЛАНИРОВАНИЕ</div><h1>Сотрудники</h1><p className="muted">Сотрудники, основные бригады, нормы и основной режим работы.</p></div>
         <a className="secondary-button" href="/">← Главное меню</a>
       </header>
 
@@ -92,6 +102,7 @@ export default function EmployeesPage() {
           <label>ФИО<input value={form.full_name} onChange={e=>setForm({...form,full_name:e.target.value})} required placeholder="Фамилия Имя Отчество"/></label>
           <label>Должность<input value={form.position} onChange={e=>setForm({...form,position:e.target.value})} required/></label>
           <label>Основная бригада<select value={form.main_brigade_id} onChange={e=>setForm({...form,main_brigade_id:e.target.value})}><option value="">Не назначена</option>{brigades.map(b=><option key={b.id} value={b.id}>Бригада {b.number}</option>)}</select></label>
+          <label>Основной график<select value={form.work_schedule_type} onChange={e=>setForm({...form,work_schedule_type:e.target.value as WorkScheduleType})}>{Object.entries(scheduleTypeLabel).map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
           <label>Дата начала<input type="date" value={form.employment_start} onChange={e=>setForm({...form,employment_start:e.target.value})}/></label>
           <label>Дата окончания<input type="date" value={form.employment_end} onChange={e=>setForm({...form,employment_end:e.target.value})}/></label>
           <label>Норма часов<input type="number" min="0" step="0.5" value={form.target_hours} onChange={e=>setForm({...form,target_hours:e.target.value})}/></label>
@@ -104,8 +115,8 @@ export default function EmployeesPage() {
       <section className="card">
         <div className="section-title"><h2>Список сотрудников</h2><span className="badge">{employees.length}</span></div>
         {loading ? <p className="muted">Загрузка...</p> : employees.length===0 ? <p className="muted">Сотрудников пока нет.</p> :
-          <div className="table-wrap"><table><thead><tr><th>ФИО</th><th>Должность</th><th>Бригада</th><th>Норма</th><th>Доп. смены</th><th>Статус</th><th></th></tr></thead>
-          <tbody>{employees.map(e=><tr key={e.id}><td><strong>{e.full_name}</strong></td><td>{e.position}</td><td>{brigadeName(e.main_brigade_id)}</td><td>{e.target_hours} ч</td><td>{e.can_extra_shifts?"Да":"Нет"}</td><td><span className={e.active?"status-ok":"status-off"}>{e.active?"Активен":"Неактивен"}</span></td><td className="actions"><button className="link-button" onClick={()=>edit(e)}>Изменить</button><button className="link-button" onClick={()=>toggleActive(e)}>{e.active?"Отключить":"Включить"}</button></td></tr>)}</tbody></table></div>}
+          <div className="table-wrap"><table><thead><tr><th>ФИО</th><th>Должность</th><th>Бригада</th><th>Основной график</th><th>Норма</th><th>Доп. смены</th><th>Статус</th><th></th></tr></thead>
+          <tbody>{employees.map(e=><tr key={e.id}><td><strong>{e.full_name}</strong></td><td>{e.position}</td><td>{brigadeName(e.main_brigade_id)}</td><td>{scheduleTypeLabel[e.work_schedule_type || "24/3"]}</td><td>{e.target_hours} ч</td><td>{e.can_extra_shifts?"Да":"Нет"}</td><td><span className={e.active?"status-ok":"status-off"}>{e.active?"Активен":"Неактивен"}</span></td><td className="actions"><button className="link-button" onClick={()=>edit(e)}>Изменить</button><button className="link-button" onClick={()=>toggleActive(e)}>{e.active?"Отключить":"Включить"}</button></td></tr>)}</tbody></table></div>}
       </section>
     </main>
   );
