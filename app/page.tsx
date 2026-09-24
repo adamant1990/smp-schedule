@@ -8,7 +8,7 @@ const sections = [
   ["💡", "Пожелания", "Ограничения и предпочтения", "/preferences"],
   ["⚠", "Конфликты", "Незакрытые смены и нарушения", "/conflicts"],
   ["📊", "Отчёты", "Нагрузка и статистика", "/reports"],
-  ["📥", "Excel", "Импорт и экспорт", "/excel"]
+  ["📥", "Excel", "Импорт и экспорт", "/excel/employees"]
 ] as const;
 
 export default function HomePage() {
