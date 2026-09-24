@@ -53,6 +53,7 @@ export type GenerationResult = {
   vacancyCount: number;
   filledVacancyCount: number;
   unfilledVacancyCount: number;
+  staffingValid: boolean;
   reasons: string[];
 };
 
@@ -180,6 +181,7 @@ export function generateSchedule(
       vacancyCount: 0,
       filledVacancyCount: 0,
       unfilledVacancyCount: 0,
+      staffingValid: false,
       reasons: ["Для формирования смены требуется ровно 8 активных бригад: 5 бригад по 2 фельдшера и 3 бригады по 1 фельдшеру."]
     };
   }
@@ -356,12 +358,36 @@ export function generateSchedule(
     if (hours > 48) reasons.push("Превышение лимита 48 часов: " + key + " = " + hours + " ч.");
   }
 
+  const finalDailyCounts = new Map<number, number>();
+  for (const shift of shifts) {
+    if (!shift.isVacancy && shift.employeeId) {
+      finalDailyCounts.set(shift.day, (finalDailyCounts.get(shift.day) ?? 0) + 1);
+    }
+  }
+  let staffingValid = true;
+  for (let day = 1; day <= days; day++) {
+    const count = finalDailyCounts.get(day) ?? 0;
+    if (count !== 13) {
+      staffingValid = false;
+      if (!reasons.some(r => r.includes(dateOf(year, month, day) + " итоговая укомплектованность"))) {
+        reasons.push(
+          dateOf(year, month, day) +
+          " итоговая укомплектованность: " + count +
+          " фельдшеров вместо 13."
+        );
+      }
+    }
+  }
+  if ([...weeklyHours.values()].some(hours => hours > 48)) staffingValid = false;
+  if (unfilledVacancyCount > 0) staffingValid = false;
+
   return {
     shifts,
     cells,
     vacancyCount: vacancies.length,
     filledVacancyCount: filled,
     unfilledVacancyCount: vacancies.length - filled,
+    staffingValid,
     reasons
   };
 }
