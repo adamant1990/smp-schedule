@@ -266,8 +266,7 @@ export default function SchedulePage() {
     if (!result.staffingValid) {
       setError(
         "График не сохранён: не выполнены жёсткие требования. " +
-        "В каждой смене должно быть ровно 13 фельдшеров (5 бригад по 2 и 3 бригады по 1), " +
-        "а у одного сотрудника не более 48 часов за календарную неделю."
+        "В каждой смене должно быть ровно 13 фельдшеров (5 бригад по 2 и 3 бригады по 1), "а также должны соблюдаться доступность сотрудников и месячные нормы часов."
       );
       setGenerationReasons(result.reasons);
       setSchedule(cellsToSchedule(employees, result.cells, days));
@@ -667,7 +666,8 @@ export default function SchedulePage() {
                                         ? "shift-817"
                                         : "shift-empty")
                             }
-                            onClick={() => changeCell(employee, day)}
+                            onClick={absentCell ? undefined : () => changeCell(employee, day)}
+                            disabled={absentCell}
                             aria-label={employee.full_name + ", день " + day}
                           >
                             {value}
