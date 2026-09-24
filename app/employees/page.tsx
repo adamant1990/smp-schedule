@@ -23,20 +23,20 @@ export default function EmployeesPage() {
   const [editing,setEditing]=useState<string|null>(null);
   const [error,setError]=useState("");
   const [loading,setLoading]=useState(true);
-  const supabase=createClient();
+  const [supabase,setSupabase]=useState<ReturnType<typeof createClient>|null>(null);
 
-  async function load() {
+  async function load(client: ReturnType<typeof createClient>) {
     setLoading(true); setError("");
     const [e,b] = await Promise.all([
-      supabase.from("employees").select("*").order("full_name"),
-      supabase.from("brigades").select("*").eq("active",true).order("number")
+      client.from("employees").select("*").order("full_name"),
+      client.from("brigades").select("*").eq("active",true).order("number")
     ]);
     if(e.error || b.error) setError(e.error?.message || b.error?.message || "Ошибка загрузки");
     else { setEmployees((e.data||[]) as Employee[]); setBrigades((b.data||[]) as Brigade[]); }
     setLoading(false);
   }
 
-  useEffect(()=>{ void load(); },[]);
+  useEffect(()=>{ const client=createClient(); setSupabase(client); void load(client); },[]);
 
   function edit(employee:Employee) {
     setEditing(employee.id);
@@ -54,7 +54,8 @@ export default function EmployeesPage() {
   function reset() { setEditing(null); setForm(emptyForm); }
 
   async function submit(event:FormEvent) {
-    event.preventDefault(); setError("");
+    event.preventDefault();
+    if (!supabase) return; setError("");
     const payload={
       full_name:form.full_name.trim(), position:form.position.trim() || "Фельдшер",
       main_brigade_id:form.main_brigade_id || null,
@@ -67,12 +68,13 @@ export default function EmployeesPage() {
       ? await supabase.from("employees").update(payload).eq("id",editing)
       : await supabase.from("employees").insert(payload);
     if(result.error) { setError(result.error.message); return; }
-    reset(); await load();
+    reset(); await load(supabase);
   }
 
   async function toggleActive(employee:Employee) {
+    if (!supabase) return;
     const {error}=await supabase.from("employees").update({active:!employee.active}).eq("id",employee.id);
-    if(error) setError(error.message); else await load();
+    if(error) setError(error.message); else await load(supabase);
   }
 
   const brigadeName=(id:string|null)=>id ? brigades.find(b=>b.id===id)?.number ?? "—" : "—";
