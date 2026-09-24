@@ -199,6 +199,21 @@ export default function SchedulePage() {
 
     const result = generateSchedule(employees, brigades, absences, year, month, mode);
 
+    if (!result.staffingValid) {
+      setError(
+        "График не сохранён: не выполнены жёсткие требования. " +
+        "В каждой смене должно быть ровно 13 фельдшеров (5 бригад по 2 и 3 бригады по 1), " +
+        "а у одного сотрудника не более 48 часов за календарную неделю."
+      );
+      setGenerationReasons(result.reasons);
+      setSchedule(cellsToSchedule(employees, result.cells, days));
+      setVacancyCount(result.vacancyCount);
+      setFilledVacancyCount(result.filledVacancyCount);
+      setUnfilledVacancyCount(result.unfilledVacancyCount);
+      setGenerating(false);
+      return;
+    }
+
     const scheduleInsert = await supabase
       .from("schedules")
       .insert({
