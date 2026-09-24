@@ -161,10 +161,10 @@ export default function SchedulePage() {
   }
 
   function buildBaseShifts(): GeneratedShift[] {
-    const generated = makeEmptySchedule(employees, days);
-    const result: GeneratedShift[] = [];
-    const employeesByBrigade = new Map<string, Employee[]>();
+    type Candidate = GeneratedShift & { mainBrigadeId: string };
+    const candidates: Candidate[] = [];
 
+    const employeesByBrigade = new Map<string, Employee[]>();
     for (const employee of employees) {
       if (!employee.main_brigade_id) continue;
       const list = employeesByBrigade.get(employee.main_brigade_id) ?? [];
@@ -172,6 +172,14 @@ export default function SchedulePage() {
       employeesByBrigade.set(employee.main_brigade_id, list);
     }
 
+    function desiredBaseShifts(employee: Employee, shiftHours: number) {
+      if (employee.target_hours <= 0) return 0;
+      return Math.max(1, Math.round(employee.target_hours / shiftHours));
+    }
+
+    // First create each employee's own base rhythm. The number of base shifts
+    // is limited by the employee's target hours; the target is approximate,
+    // not a hard ceiling.
     for (const brigade of brigades) {
       const brigadeEmployees = [...(employeesByBrigade.get(brigade.id) ?? [])]
         .sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"));
@@ -185,37 +193,122 @@ export default function SchedulePage() {
       for (const employee of byType["24/3"]) {
         const index = byType["24/3"].indexOf(employee);
         const phase = index % 4;
-        for (let day = 1; day <= days; day += 1) {
+        const wanted = desiredBaseShifts(employee, 24);
+        let produced = 0;
+
+        for (let day = 1; day <= days && produced < wanted; day += 1) {
           if ((day - 1) % 4 !== phase || !isEmployeeAvailable(employee, year, month, day)) continue;
-          result.push({ employeeId: employee.id, brigadeId: brigade.id, day, label: "24", hours: 24, startHour: 8, endHour: 8 });
+          candidates.push({
+            employeeId: employee.id,
+            brigadeId: brigade.id,
+            mainBrigadeId: brigade.id,
+            day,
+            label: "24",
+            hours: 24,
+            startHour: 8,
+            endHour: 8
+          });
+          produced += 1;
         }
       }
 
       for (const employee of byType.day_night_2_off) {
         const index = byType.day_night_2_off.indexOf(employee);
         const phase = index % 4;
-        for (let day = 1; day <= days; day += 1) {
+        const wanted = desiredBaseShifts(employee, 12);
+        let produced = 0;
+
+        for (let day = 1; day <= days && produced < wanted; day += 1) {
           if (!isEmployeeAvailable(employee, year, month, day)) continue;
           const cycleDay = (day - 1 - phase + 400) % 4;
+
           if (cycleDay === 0) {
-            result.push({ employeeId: employee.id, brigadeId: brigade.id, day, label: "12Д", hours: 12, startHour: 8, endHour: 20 });
+            candidates.push({
+              employeeId: employee.id,
+              brigadeId: brigade.id,
+              mainBrigadeId: brigade.id,
+              day,
+              label: "12Д",
+              hours: 12,
+              startHour: 8,
+              endHour: 20
+            });
+            produced += 1;
           } else if (cycleDay === 1) {
-            result.push({ employeeId: employee.id, brigadeId: brigade.id, day, label: "12Н", hours: 12, startHour: 20, endHour: 8 });
+            candidates.push({
+              employeeId: employee.id,
+              brigadeId: brigade.id,
+              mainBrigadeId: brigade.id,
+              day,
+              label: "12Н",
+              hours: 12,
+              startHour: 20,
+              endHour: 8
+            });
+            produced += 1;
           }
         }
       }
 
       for (const employee of byType["8_17"]) {
+        // The 08:00–17:00 employee keeps a weekday daytime rhythm.
         for (let day = 1; day <= days; day += 1) {
           const weekday = new Date(year, month, day).getDay();
           if (weekday === 0 || weekday === 6 || !isEmployeeAvailable(employee, year, month, day)) continue;
-          result.push({ employeeId: employee.id, brigadeId: brigade.id, day, label: "8–17", hours: 9, startHour: 8, endHour: 17 });
+          candidates.push({
+            employeeId: employee.id,
+            brigadeId: brigade.id,
+            mainBrigadeId: brigade.id,
+            day,
+            label: "8–17",
+            hours: 9,
+            startHour: 8,
+            endHour: 17
+          });
         }
       }
+    }
 
-      // Do not add extras here. The next algorithm stage will use can_extra_shifts
-      // to close only the remaining vacancies.
-      void generated;
+    // Now place those base shifts into actual brigade positions.
+    // Main brigade is preferred, but it is not absolute: if it is already
+    // full, the shift is temporarily placed into another brigade with a vacancy.
+    const coverage = new Map<string, number>();
+    const assignedByEmployeeDay = new Set<string>();
+    const result: GeneratedShift[] = [];
+
+    const brigadeOrder = [...brigades].sort((a, b) => a.number - b.number);
+
+    for (let day = 1; day <= days; day += 1) {
+      const dayCandidates = candidates
+        .filter((candidate) => candidate.day === day)
+        .sort((a, b) => {
+          if (a.mainBrigadeId === b.mainBrigadeId) return a.employeeId.localeCompare(b.employeeId);
+          return a.mainBrigadeId.localeCompare(b.mainBrigadeId);
+        });
+
+      for (const candidate of dayCandidates) {
+        const employeeDayKey = candidate.employeeId + ":" + candidate.day;
+        if (assignedByEmployeeDay.has(employeeDayKey)) continue;
+
+        const mainBrigade = brigadeOrder.find((brigade) => brigade.id === candidate.mainBrigadeId);
+        const preferred = mainBrigade ? [mainBrigade, ...brigadeOrder.filter((brigade) => brigade.id !== mainBrigade.id)] : brigadeOrder;
+
+        const target = preferred.find((brigade) => {
+          const used = coverage.get(brigade.id + ":" + day) ?? 0;
+          return used < brigade.required_feldshers;
+        });
+
+        if (!target) {
+          // The base rhythm still exists, but there is no free required
+          // position today. Do not create a fourth/extra position just to
+          // keep the employee's main brigade.
+          continue;
+        }
+
+        result.push({ ...candidate, brigadeId: target.id });
+        coverage.set(target.id + ":" + day, (coverage.get(target.id + ":" + day) ?? 0) + 1);
+        assignedByEmployeeDay.add(employeeDayKey);
+      }
     }
 
     return result;
