@@ -261,10 +261,23 @@ export type AssistantIssue = {
   candidates: AssistantCandidate[];
 };
 
+export type AssistantCoverage = {
+  day: number;
+  dayTotal: number;
+  nightTotal: number;
+  brigades: Array<{
+    brigadeNumber: number;
+    day: number;
+    required: number;
+    night: number;
+  }>;
+};
+
 export type AssistantResult = {
   issues: AssistantIssue[];
   dayMissing: number;
   nightMissing: number;
+  coverage: AssistantCoverage[];
 };
 
 function normalizeManualShiftLabel(value: unknown): ShiftLabel | null {
@@ -272,7 +285,7 @@ function normalizeManualShiftLabel(value: unknown): ShiftLabel | null {
     .trim()
     .toUpperCase()
     .replace(/–/g, "-")
-    .replace(/\\s+/g, "");
+    .replace(/\s+/g, "");
 
   if (!raw) return null;
   if (raw === "24" || raw === "8-8" || raw === "08-08" || raw === "8:00-8:00" || raw === "08:00-08:00" || raw === "24Ч" || raw === "24ЧАСА") return "24";
@@ -374,9 +387,10 @@ export function analyzeManualSchedule(
   const issues: AssistantIssue[] = [];
   let dayMissing = 0;
   let nightMissing = 0;
+  const coverage: AssistantCoverage[] = [];
 
   if (!staffing.valid) {
-    return { issues: [], dayMissing: 0, nightMissing: 0 };
+    return { issues: [], dayMissing: 0, nightMissing: 0, coverage: [] };
   }
 
   const hoursByEmployee = new Map<string, number>();
@@ -447,6 +461,19 @@ export function analyzeManualSchedule(
   }
 
   for (let day = 1; day <= daysInMonth(year, month); day++) {
+    const brigadeCoverage = staffing.active.map((brigade) => {
+      const required = staffing.required.get(brigade.id) ?? 0;
+      const dayCount = count(brigade.id, day, "day");
+      const nightCount = count(brigade.id, day, "night");
+      return { brigadeNumber: brigade.number, day: dayCount, required, night: nightCount };
+    });
+    coverage.push({
+      day,
+      dayTotal: brigadeCoverage.reduce((sum, item) => sum + item.day, 0),
+      nightTotal: brigadeCoverage.reduce((sum, item) => sum + item.night, 0),
+      brigades: brigadeCoverage
+    });
+
     for (const brigade of staffing.active) {
       const required = staffing.required.get(brigade.id) ?? 0;
       for (const period of ["day", "night"] as const) {
@@ -467,7 +494,7 @@ export function analyzeManualSchedule(
     }
   }
 
-  return { issues, dayMissing, nightMissing };
+  return { issues, dayMissing, nightMissing, coverage };
 }
 
 export function generateSchedule(
