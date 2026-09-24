@@ -386,6 +386,7 @@ export function analyzeManualSchedule(
 
     return employees
       .filter(e => assistantCandidateOK(e, day, label, shifts, year, month, absences))
+      .filter(e => e.main_brigade_id === brigadeId)
       .map(e => {
         const target = adjustedMonthlyTarget(e, year, month, absences);
         const actual = hoursByEmployee.get(e.id) ?? 0;
@@ -418,7 +419,7 @@ export function analyzeManualSchedule(
         deficit: x.deficit,
         reason: x.sameBrigade
           ? "своя бригада; можно взять дополнительную смену"
-          : "другая бригада; подходит по ограничениям"
+          : "подходит по ограничениям"
       }));
   }
 
