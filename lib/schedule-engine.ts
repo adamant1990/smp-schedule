@@ -196,58 +196,99 @@ export function generateSchedule(
   }
   for (const list of byBrigade.values()) list.sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"));
 
-  // The employee's original cycle is always generated first and is never shifted
-  // because of an absence. This is the key invariant for both planning modes.
-  for (const e of employees) {
-    const brigadeEmployees = byBrigade.get(e.main_brigade_id ?? "") ?? [];
-    const employeeIndex = Math.max(0, brigadeEmployees.findIndex(x => x.id === e.id));
-    const required = staffing.required.get(e.main_brigade_id ?? "") ?? 0;
-    const sameScheduleEmployees = brigadeEmployees.filter(x => x.work_schedule_type === e.work_schedule_type);
-    const sameIndex = Math.max(0, sameScheduleEmployees.findIndex(x => x.id === e.id));
-    const phase = e.work_schedule_type === "24/3"
-      ? Math.floor(sameIndex / Math.max(1, required)) % 4
-      : e.work_schedule_type === "day_night_2_off"
-        ? Math.floor(sameIndex / Math.max(1, required)) % 4
-        : employeeIndex % 5;
-    for (let day = 1; day <= days; day++) {
-      const label = cycleLabel(e, day, phase, year, month);
-      if (!label || !employed(e, year, month, day) || !e.main_brigade_id) continue;
-      if (absent(e, year, month, day, absences)) {
-        shifts.push({
-          employeeId: null, sourceEmployeeId: e.id, brigadeId: e.main_brigade_id,
-          day, label, hours: shiftHours(label), shiftType: "base", isVacancy: true,
-          note: "Основная смена сохранена как вакансия из-за отсутствия."
+  // Build exactly the required number of base positions for every brigade/day.
+  // A work cycle describes when an employee is available for his/her base shift;
+  // it must not create extra positions beyond the 13 positions required by the station.
+  const phaseByEmployee = new Map<string, number>();
+
+  for (const [brigadeId, brigadeEmployees] of byBrigade) {
+    const required = staffing.required.get(brigadeId) ?? 0;
+    const byType = new Map<WorkScheduleType, Employee[]>();
+    for (const e of brigadeEmployees) {
+      const list = byType.get(e.work_schedule_type) ?? [];
+      list.push(e);
+      byType.set(e.work_schedule_type, list);
+    }
+
+    for (const list of byType.values()) {
+      list.sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"));
+      list.forEach((e, index) => phaseByEmployee.set(e.id, Math.floor(index / Math.max(1, required)) % 4));
+    }
+  }
+
+  for (let day = 1; day <= days; day++) {
+    for (const brigade of staffing.active) {
+      const required = staffing.required.get(brigade.id) ?? 0;
+      const brigadeEmployees = byBrigade.get(brigade.id) ?? [];
+
+      const candidates = brigadeEmployees
+        .filter(e => e.active && e.main_brigade_id === brigade.id && employed(e, year, month, day))
+        .map(e => ({
+          e,
+          label: cycleLabel(e, day, phaseByEmployee.get(e.id) ?? 0, year, month)
+        }))
+        .filter(x => x.label !== null)
+        .filter(x => {
+          const used = hoursForEmployeeInWeek(x.e.id, shifts, year, month, weekKey(year, month, day));
+          return used + shiftHours(x.label!) <= 48;
+        })
+        .sort((a, b) => {
+          const aAbsent = absent(a.e, year, month, day, absences) ? 1 : 0;
+          const bAbsent = absent(b.e, year, month, day, absences) ? 1 : 0;
+          if (aAbsent !== bAbsent) return aAbsent - bAbsent;
+          return a.e.full_name.localeCompare(b.e.full_name, "ru");
         });
-        cells[e.id][day] = { label: "В", kind: "absence" };
-      } else {
-        shifts.push({
-          employeeId: e.id, brigadeId: e.main_brigade_id, day, label,
-          hours: shiftHours(label), shiftType: "base", isVacancy: false
-        });
-        cells[e.id][day] = { label, kind: "base" };
+
+      const selected = candidates.slice(0, required);
+
+      for (const { e, label } of selected) {
+        const shift: GeneratedShift = {
+          employeeId: null,
+          sourceEmployeeId: e.id,
+          brigadeId: brigade.id,
+          day,
+          label: label!,
+          hours: shiftHours(label!),
+          shiftType: "base",
+          isVacancy: true
+        };
+
+        if (absent(e, year, month, day, absences)) {
+          shift.note = "Основная смена сохранена как вакансия из-за отсутствия.";
+          cells[e.id][day] = { label: "В", kind: "absence" };
+        } else {
+          shift.employeeId = e.id;
+          shift.isVacancy = false;
+          delete shift.sourceEmployeeId;
+          delete shift.note;
+          cells[e.id][day] = { label: label!, kind: "base" };
+        }
+
+        shifts.push(shift);
+      }
+
+      // If the cycle cannot provide enough people, create explicit vacancies.
+      // These are then handled by the replacement logic below.
+      if (selected.length < required) {
+        const missing = required - selected.length;
+        for (let i = 0; i < missing; i++) {
+          shifts.push({
+            employeeId: null,
+            brigadeId: brigade.id,
+            day,
+            label: "24",
+            hours: 24,
+            shiftType: "base",
+            isVacancy: true,
+            note: "Не найден сотрудник в основном цикле."
+          });
+        }
       }
     }
   }
 
   const vacancies = shifts.filter(s => s.isVacancy);
   let filled = 0;
-
-  // Hard staffing rule: every calendar day must contain exactly 13 active feldsher
-  // positions distributed as 2+2+2+2+2+1+1+1 across brigades.
-  for (let day = 1; day <= days; day++) {
-    const dayActive = shifts.filter(s => s.day === day && !s.isVacancy);
-    const dayVacancies = shifts.filter(s => s.day === day && s.isVacancy);
-    const counts = new Map<string, number>();
-    for (const s of dayActive) counts.set(s.brigadeId, (counts.get(s.brigadeId) ?? 0) + 1);
-    const total = dayActive.length;
-    if (total !== 13 || dayVacancies.length > 0) {
-      reasons.push(
-        "На " + dateOf(year, month, day) +
-        " до закрытия вакансий сформировано " + total +
-        " назначений вместо 13. Требование: 5 бригад × 2 + 3 бригады × 1."
-      );
-    }
-  }
 
   for (const vacancy of vacancies) {
     const active = shifts.filter(s => !s.isVacancy);
