@@ -95,6 +95,35 @@ function overlaps(a: GeneratedShift, b: GeneratedShift) {
   return aStart < bStart + b.hours && bStart < aStart + a.hours;
 }
 
+function weekKey(year: number, month: number, day: number) {
+  const d = new Date(year, month, day);
+  const dayOfWeek = d.getDay() || 7;
+  d.setDate(d.getDate() - dayOfWeek + 1);
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+function hoursForEmployeeInWeek(
+  employeeId: string,
+  shifts: GeneratedShift[],
+  year: number,
+  month: number,
+  targetWeek: string
+) {
+  return shifts
+    .filter(s => s.employeeId === employeeId && weekKey(year, month, s.day) === targetWeek)
+    .reduce((sum, s) => sum + s.hours, 0);
+}
+
+function staffingRequirements(brigades: Brigade[]) {
+  const active = brigades.filter(b => b.active).sort((a, b) => a.number - b.number);
+  if (active.length !== 8) {
+    return { valid: false, active, required: new Map<string, number>(), total: 13 };
+  }
+  const required = new Map<string, number>();
+  active.forEach((b, index) => required.set(b.id, index < 5 ? 2 : 1));
+  return { valid: true, active, required, total: 13 };
+}
+
 function candidateOK(
   e: Employee,
   day: number,
@@ -108,6 +137,8 @@ function candidateOK(
   if (!e.active || !e.main_brigade_id || !employed(e, year, month, day)) return false;
   if (absent(e, year, month, day, absences)) return false;
   if (extraOnly && !e.can_extra_shifts) return false;
+  const targetWeek = weekKey(year, month, day);
+  if (hoursForEmployeeInWeek(e.id, shifts, year, month, targetWeek) + shiftHours(label) > 48) return false;
   const probe: GeneratedShift = {
     employeeId: e.id, brigadeId: e.main_brigade_id, day, label,
     hours: shiftHours(label), shiftType: "replacement", isVacancy: false
@@ -140,6 +171,18 @@ export function generateSchedule(
   const shifts: GeneratedShift[] = [];
   const reasons: string[] = [];
   const byBrigade = new Map<string, Employee[]>();
+  const staffing = staffingRequirements(brigades);
+
+  if (!staffing.valid) {
+    return {
+      shifts: [],
+      cells: Object.fromEntries(employees.map(e => [e.id, Object.fromEntries(Array.from({ length: days }, (_, i) => [i + 1, { label: "", kind: "base" as const }]))])),
+      vacancyCount: 0,
+      filledVacancyCount: 0,
+      unfilledVacancyCount: 0,
+      reasons: ["Для формирования смены требуется ровно 8 активных бригад: 5 бригад по 2 фельдшера и 3 бригады по 1 фельдшеру."]
+    };
+  }
 
   for (const e of employees) {
     cells[e.id] = {};
@@ -155,7 +198,15 @@ export function generateSchedule(
   // because of an absence. This is the key invariant for both planning modes.
   for (const e of employees) {
     const brigadeEmployees = byBrigade.get(e.main_brigade_id ?? "") ?? [];
-    const phase = Math.max(0, brigadeEmployees.findIndex(x => x.id === e.id)) % 4;
+    const employeeIndex = Math.max(0, brigadeEmployees.findIndex(x => x.id === e.id));
+    const required = staffing.required.get(e.main_brigade_id ?? "") ?? 0;
+    const sameScheduleEmployees = brigadeEmployees.filter(x => x.work_schedule_type === e.work_schedule_type);
+    const sameIndex = Math.max(0, sameScheduleEmployees.findIndex(x => x.id === e.id));
+    const phase = e.work_schedule_type === "24/3"
+      ? Math.floor(sameIndex / Math.max(1, required)) % 4
+      : e.work_schedule_type === "day_night_2_off"
+        ? Math.floor(sameIndex / Math.max(1, required)) % 4
+        : employeeIndex % 5;
     for (let day = 1; day <= days; day++) {
       const label = cycleLabel(e, day, phase, year, month);
       if (!label || !employed(e, year, month, day) || !e.main_brigade_id) continue;
@@ -178,6 +229,23 @@ export function generateSchedule(
 
   const vacancies = shifts.filter(s => s.isVacancy);
   let filled = 0;
+
+  // Hard staffing rule: every calendar day must contain exactly 13 active feldsher
+  // positions distributed as 2+2+2+2+2+1+1+1 across brigades.
+  for (let day = 1; day <= days; day++) {
+    const dayActive = shifts.filter(s => s.day === day && !s.isVacancy);
+    const dayVacancies = shifts.filter(s => s.day === day && s.isVacancy);
+    const counts = new Map<string, number>();
+    for (const s of dayActive) counts.set(s.brigadeId, (counts.get(s.brigadeId) ?? 0) + 1);
+    const total = dayActive.length;
+    if (total !== 13 || dayVacancies.length > 0) {
+      reasons.push(
+        "На " + dateOf(year, month, day) +
+        " до закрытия вакансий сформировано " + total +
+        " назначений вместо 13. Требование: 5 бригад × 2 + 3 бригады × 1."
+      );
+    }
+  }
 
   for (const vacancy of vacancies) {
     const active = shifts.filter(s => !s.isVacancy);
@@ -248,6 +316,16 @@ export function generateSchedule(
     }
 
     if (replacement) {
+      // Never allow an automatic replacement to push the employee above 48 hours
+      // in the same calendar week.
+      const targetWeek = weekKey(year, month, vacancy.day);
+      const alreadyWorked = hoursForEmployeeInWeek(replacement.id, shifts, year, month, targetWeek);
+      if (alreadyWorked + shiftHours(label) > 48) {
+        replacement = undefined;
+      }
+    }
+
+    if (replacement) {
       shifts.push({
         employeeId: replacement.id, brigadeId, day: vacancy.day, label,
         hours: shiftHours(label), shiftType, isVacancy: false,
@@ -265,6 +343,17 @@ export function generateSchedule(
         ", смена " + vacancy.label
       );
     }
+  }
+
+  // Final hard check: no employee may exceed 48 hours in a calendar week.
+  const weeklyHours = new Map<string, number>();
+  for (const shift of shifts) {
+    if (!shift.employeeId) continue;
+    const key = shift.employeeId + ":" + weekKey(year, month, shift.day);
+    weeklyHours.set(key, (weeklyHours.get(key) ?? 0) + shift.hours);
+  }
+  for (const [key, hours] of weeklyHours) {
+    if (hours > 48) reasons.push("Превышение лимита 48 часов: " + key + " = " + hours + " ч.");
   }
 
   return {
