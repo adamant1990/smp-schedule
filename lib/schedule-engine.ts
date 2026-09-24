@@ -379,7 +379,7 @@ export function generateSchedule(
     }
   }
   if ([...weeklyHours.values()].some(hours => hours > 48)) staffingValid = false;
-  if (unfilledVacancyCount > 0) staffingValid = false;
+  if (vacancies.length - filled > 0) staffingValid = false;
 
   return {
     shifts,
