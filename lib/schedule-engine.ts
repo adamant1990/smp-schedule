@@ -195,6 +195,11 @@ export function generateSchedule(
   for (const e of employees) {
     cells[e.id] = {};
     for (let d = 1; d <= days; d++) cells[e.id][d] = { label: "", kind: "base" };
+    for (let d = 1; d <= days; d++) {
+      if (absent(e, year, month, d, absences)) {
+        cells[e.id][d] = { label: "В", kind: "absence" };
+      }
+    }
     if (!e.main_brigade_id) continue;
     const list = byBrigade.get(e.main_brigade_id) ?? [];
     list.push(e);
@@ -259,9 +264,7 @@ export function generateSchedule(
       .filter(x => candidateOK(x.e, day, x.label!, shifts, year, month, absences, false))
       .sort((a, b) => assignmentScore(a.e, day, a.label!, brigadeId) - assignmentScore(b.e, day, b.label!, brigadeId));
 
-    if (local.length > 0) return local[0];
-
-    if (!allowGlobalExtra) return undefined;
+    if (!allowGlobalExtra) return local[0];
 
     const global = employees
       .filter(e => e.main_brigade_id && e.main_brigade_id !== brigadeId && e.can_extra_shifts)
@@ -270,7 +273,19 @@ export function generateSchedule(
       .filter(x => candidateOK(x.e, day, x.label!, shifts, year, month, absences, true))
       .sort((a, b) => assignmentScore(a.e, day, a.label!, brigadeId) - assignmentScore(b.e, day, b.label!, brigadeId));
 
-    return global[0];
+    // Compare the best employee from the home brigade with the best employee
+    // who can take an extra shift. This is important for brigades with many
+    // employees but only one daily position: otherwise their staff would
+    // remain almost without shifts while other brigades consume all slots.
+    const bestLocal = local[0];
+    const bestGlobal = global[0];
+    if (!bestLocal) return bestGlobal;
+    if (!bestGlobal) return bestLocal;
+
+    return assignmentScore(bestGlobal.e, day, bestGlobal.label!, brigadeId) <
+      assignmentScore(bestLocal.e, day, bestLocal.label!, brigadeId)
+      ? bestGlobal
+      : bestLocal;
   }
 
   // Fill exactly 13 positions every day. First use employees in their own
