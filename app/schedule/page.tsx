@@ -4,13 +4,29 @@ import { useEffect, useMemo, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 
 type Brigade = { id: string; number: number; active: boolean; required_feldshers: number };
+type WorkScheduleType = "24/3" | "day_night_2_off" | "8_17";
 type Employee = {
   id: string; full_name: string; position: string; main_brigade_id: string | null;
   employment_start: string | null; employment_end: string | null;
-  target_hours: number; active: boolean;
+  target_hours: number; can_extra_shifts: boolean; work_schedule_type: WorkScheduleType; active: boolean;
 };
-type Cell = "" | "24";
+type Cell = "" | "24" | "12Д" | "12Н" | "8–17";
 type Schedule = Record<string, Record<number, Cell>>;
+type GeneratedShift = {
+  employeeId: string;
+  brigadeId: string;
+  day: number;
+  label: Exclude<Cell, "">;
+  hours: number;
+  startHour: number;
+  endHour: number;
+};
+
+const scheduleTypeLabel: Record<WorkScheduleType, string> = {
+  "24/3": "24 ч / 3 выходных",
+  day_night_2_off: "день / ночь / 2 выходных",
+  "8_17": "08:00–17:00"
+};
 
 function monthDays(year: number, month: number) {
   return new Date(year, month + 1, 0).getDate();
@@ -22,7 +38,7 @@ function makeEmptySchedule(employees: Employee[], days: number): Schedule {
       employee.id,
       Object.fromEntries(Array.from({ length: days }, (_, index) => [index + 1, ""]))
     ])
-  );
+  ) as Schedule;
 }
 
 function isoDate(year: number, month: number, day: number) {
@@ -35,6 +51,25 @@ function isEmployeeAvailable(employee: Employee, year: number, month: number, da
   if (employee.employment_start && date < employee.employment_start) return false;
   if (employee.employment_end && date > employee.employment_end) return false;
   return true;
+}
+
+function addDays(year: number, month: number, day: number, amount: number) {
+  const date = new Date(year, month, day + amount);
+  return date.getFullYear() + "-" + String(date.getMonth() + 1).padStart(2, "0") + "-" + String(date.getDate()).padStart(2, "0");
+}
+
+function shiftTimes(year: number, month: number, shift: GeneratedShift) {
+  const date = isoDate(year, month, shift.day);
+  if (shift.label === "24") {
+    return { start_at: date + "T08:00:00", end_at: addDays(year, month, shift.day, 1) + "T08:00:00" };
+  }
+  if (shift.label === "12Д") {
+    return { start_at: date + "T08:00:00", end_at: date + "T20:00:00" };
+  }
+  if (shift.label === "12Н") {
+    return { start_at: date + "T20:00:00", end_at: addDays(year, month, shift.day, 1) + "T08:00:00" };
+  }
+  return { start_at: date + "T08:00:00", end_at: date + "T17:00:00" };
 }
 
 export default function SchedulePage() {
@@ -63,7 +98,7 @@ export default function SchedulePage() {
 
     const [employeesResult, brigadesResult] = await Promise.all([
       supabase.from("employees")
-        .select("id, full_name, position, main_brigade_id, employment_start, employment_end, target_hours, active")
+        .select("id, full_name, position, main_brigade_id, employment_start, employment_end, target_hours, can_extra_shifts, work_schedule_type, active")
         .eq("active", true).order("full_name"),
       supabase.from("brigades")
         .select("id, number, active, required_feldshers")
@@ -99,11 +134,22 @@ export default function SchedulePage() {
     });
   }, [year, month, days, employees]);
 
-  function changeCell(employeeId: string, day: number) {
+  function manualValues(employee: Employee): Cell[] {
+    if (employee.work_schedule_type === "day_night_2_off") return ["", "12Д", "12Н"];
+    if (employee.work_schedule_type === "8_17") return ["", "8–17"];
+    return ["", "24"];
+  }
+
+  function changeCell(employee: Employee, day: number) {
+    const values = manualValues(employee);
     setSchedule((current) => {
-      const values = { ...(current[employeeId] ?? {}) };
-      values[day] = values[day] === "24" ? "" : "24";
-      return { ...current, [employeeId]: values };
+      const currentValue = current[employee.id]?.[day] ?? "";
+      const index = values.indexOf(currentValue);
+      const nextValue = values[(index + 1) % values.length];
+      return {
+        ...current,
+        [employee.id]: { ...(current[employee.id] ?? {}), [day]: nextValue }
+      };
     });
   }
 
@@ -112,6 +158,67 @@ export default function SchedulePage() {
     setVacancyCount(0);
     setMessage("");
     setError("");
+  }
+
+  function buildBaseShifts(): GeneratedShift[] {
+    const generated = makeEmptySchedule(employees, days);
+    const result: GeneratedShift[] = [];
+    const employeesByBrigade = new Map<string, Employee[]>();
+
+    for (const employee of employees) {
+      if (!employee.main_brigade_id) continue;
+      const list = employeesByBrigade.get(employee.main_brigade_id) ?? [];
+      list.push(employee);
+      employeesByBrigade.set(employee.main_brigade_id, list);
+    }
+
+    for (const brigade of brigades) {
+      const brigadeEmployees = [...(employeesByBrigade.get(brigade.id) ?? [])]
+        .sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"));
+
+      const byType: Record<WorkScheduleType, Employee[]> = {
+        "24/3": brigadeEmployees.filter((employee) => employee.work_schedule_type === "24/3"),
+        day_night_2_off: brigadeEmployees.filter((employee) => employee.work_schedule_type === "day_night_2_off"),
+        "8_17": brigadeEmployees.filter((employee) => employee.work_schedule_type === "8_17")
+      };
+
+      for (const employee of byType["24/3"]) {
+        const index = byType["24/3"].indexOf(employee);
+        const phase = index % 4;
+        for (let day = 1; day <= days; day += 1) {
+          if ((day - 1) % 4 !== phase || !isEmployeeAvailable(employee, year, month, day)) continue;
+          result.push({ employeeId: employee.id, brigadeId: brigade.id, day, label: "24", hours: 24, startHour: 8, endHour: 8 });
+        }
+      }
+
+      for (const employee of byType.day_night_2_off) {
+        const index = byType.day_night_2_off.indexOf(employee);
+        const phase = index % 4;
+        for (let day = 1; day <= days; day += 1) {
+          if (!isEmployeeAvailable(employee, year, month, day)) continue;
+          const cycleDay = (day - 1 - phase + 400) % 4;
+          if (cycleDay === 0) {
+            result.push({ employeeId: employee.id, brigadeId: brigade.id, day, label: "12Д", hours: 12, startHour: 8, endHour: 20 });
+          } else if (cycleDay === 1) {
+            result.push({ employeeId: employee.id, brigadeId: brigade.id, day, label: "12Н", hours: 12, startHour: 20, endHour: 8 });
+          }
+        }
+      }
+
+      for (const employee of byType["8_17"]) {
+        for (let day = 1; day <= days; day += 1) {
+          const weekday = new Date(year, month, day).getDay();
+          if (weekday === 0 || weekday === 6 || !isEmployeeAvailable(employee, year, month, day)) continue;
+          result.push({ employeeId: employee.id, brigadeId: brigade.id, day, label: "8–17", hours: 9, startHour: 8, endHour: 17 });
+        }
+      }
+
+      // Do not add extras here. The next algorithm stage will use can_extra_shifts
+      // to close only the remaining vacancies.
+      void generated;
+    }
+
+    return result;
   }
 
   async function generateBaseSchedule() {
@@ -137,36 +244,15 @@ export default function SchedulePage() {
       return;
     }
 
+    const baseShifts = buildBaseShifts();
     const generated = makeEmptySchedule(employees, days);
-    const shiftsToCreate: Array<{ employeeId: string; brigadeId: string; day: number }> = [];
-    const employeesByBrigade = new Map<string, Employee[]>();
 
-    for (const employee of employees) {
-      if (!employee.main_brigade_id) continue;
-      const list = employeesByBrigade.get(employee.main_brigade_id) ?? [];
-      list.push(employee);
-      employeesByBrigade.set(employee.main_brigade_id, list);
-    }
-
-    for (const brigade of brigades) {
-      const brigadeEmployees = [...(employeesByBrigade.get(brigade.id) ?? [])]
-        .sort((a, b) => a.full_name.localeCompare(b.full_name, "ru"));
-
-      brigadeEmployees.forEach((employee, index) => {
-        const phase = index % 4;
-
-        for (let day = 1; day <= days; day += 1) {
-          if ((day - 1) % 4 !== phase) continue;
-          if (!isEmployeeAvailable(employee, year, month, day)) continue;
-
-          generated[employee.id][day] = "24";
-          shiftsToCreate.push({ employeeId: employee.id, brigadeId: brigade.id, day });
-        }
-      });
+    for (const shift of baseShifts) {
+      generated[shift.employeeId][shift.day] = shift.label;
     }
 
     const coverage = new Map<string, number>();
-    for (const item of shiftsToCreate) {
+    for (const item of baseShifts) {
       const key = item.brigadeId + ":" + item.day;
       coverage.set(key, (coverage.get(key) ?? 0) + 1);
     }
@@ -191,17 +277,16 @@ export default function SchedulePage() {
 
     const scheduleId = scheduleInsert.data.id;
 
-    const shiftRows = shiftsToCreate.map((item) => {
-      const date = isoDate(year, month, item.day);
-      const endDate = isoDate(year, month, item.day + 1);
+    const shiftRows = baseShifts.map((item) => {
+      const times = shiftTimes(year, month, item);
       return {
         schedule_id: scheduleId,
         brigade_id: item.brigadeId,
-        shift_date: date,
+        shift_date: isoDate(year, month, item.day),
         shift_type: "base",
-        start_at: date + "T08:00:00",
-        end_at: endDate + "T08:00:00",
-        required_hours: 24,
+        start_at: times.start_at,
+        end_at: times.end_at,
+        required_hours: item.hours,
         is_fixed: false,
         is_vacancy: false
       };
@@ -219,7 +304,7 @@ export default function SchedulePage() {
 
       const assignments = shiftsInsert.data.map((shift, index) => ({
         shift_id: shift.id,
-        employee_id: shiftsToCreate[index].employeeId,
+        employee_id: baseShifts[index].employeeId,
         assignment_status: "assigned",
         is_user_fixed: false
       }));
@@ -238,12 +323,14 @@ export default function SchedulePage() {
     await supabase.from("schedule_versions").insert({
       schedule_id: scheduleId,
       version_number: 1,
-      reason: "Первичное формирование базового цикла 24 часа через 3 дня",
+      reason: "Первичное формирование базовых режимов сотрудников",
       snapshot: {
         year,
         month: month + 1,
-        shift_count: shiftsToCreate.length,
-        vacancy_count: vacancies
+        shift_count: baseShifts.length,
+        vacancy_count: vacancies,
+        rules: ["24/3", "day_night_2_off", "8_17"],
+        extra_shifts_enabled: false
       }
     });
 
@@ -254,15 +341,16 @@ export default function SchedulePage() {
       entity_id: scheduleId,
       details: {
         mode: "A",
-        base_cycle: "24h_every_4th_day",
-        shift_count: shiftsToCreate.length,
-        vacancy_count: vacancies
+        base_schedule_types: ["24/3", "day_night_2_off", "8_17"],
+        shift_count: baseShifts.length,
+        vacancy_count: vacancies,
+        extra_shifts_used: false
       }
     });
 
     setSchedule(generated);
     setVacancyCount(vacancies);
-    setMessage("Базовый график сформирован: " + shiftsToCreate.length + " смен. Незаполненных позиций: " + vacancies + ".");
+    setMessage("Базовый график сформирован: " + baseShifts.length + " смен. Незаполненных позиций: " + vacancies + ". Дополнительные смены пока не назначаются.");
     setGenerating(false);
   }
 
@@ -282,7 +370,7 @@ export default function SchedulePage() {
         <div>
           <div className="eyebrow">СМП • ПЛАНИРОВАНИЕ</div>
           <h1>График фельдшеров</h1>
-          <p className="muted">Базовый цикл: 24 часа → 3 дня отдыха.</p>
+          <p className="muted">Базовые режимы: 24/3, день/ночь/2 выходных и 08:00–17:00.</p>
         </div>
         <a className="secondary-button" href="/">← Главное меню</a>
       </header>
@@ -326,7 +414,8 @@ export default function SchedulePage() {
           <div>
             <h2>Месячная таблица</h2>
             <p className="muted schedule-hint">
-              Базовые смены отмечены как 24. Нажмите на ячейку для ручного добавления или удаления базовой смены.
+              Базовые смены: 24 — сутки, 12Д — день, 12Н — ночь, 8–17 — дневная смена.
+              Нажатие на ячейку циклически меняет смену для ручной корректировки.
             </p>
           </div>
         </div>
@@ -341,6 +430,7 @@ export default function SchedulePage() {
                   <th className="sticky-name">ФИО</th>
                   <th className="brigade-head">Бригада</th>
                   <th className="hours-head">Норма</th>
+                  <th className="hours-head">Основной график</th>
                   {Array.from({ length: days }, (_, index) => <th key={index + 1}>{index + 1}</th>)}
                 </tr>
               </thead>
@@ -355,17 +445,18 @@ export default function SchedulePage() {
                       {employee.main_brigade_id ? brigadeMap.get(employee.main_brigade_id) ?? "—" : "—"}
                     </td>
                     <td className="hours-cell">{employee.target_hours ?? 0}</td>
+                    <td className="hours-cell">{scheduleTypeLabel[employee.work_schedule_type || "24/3"]}</td>
                     {Array.from({ length: days }, (_, index) => {
                       const day = index + 1;
                       const value = schedule[employee.id]?.[day] ?? "";
                       return (
                         <td key={day}>
                           <button
-                            className={"shift-cell shift-" + (value === "24" ? "24" : "empty")}
-                            onClick={() => changeCell(employee.id, day)}
+                            className={"shift-cell shift-" + (value === "24" ? "24" : value ? "12" : "empty")}
+                            onClick={() => changeCell(employee, day)}
                             aria-label={employee.full_name + ", день " + day}
                           >
-                            {value === "24" ? "24" : ""}
+                            {value}
                           </button>
                         </td>
                       );
@@ -379,12 +470,12 @@ export default function SchedulePage() {
       </section>
 
       <section className="card">
-        <h2>Что делает первый алгоритм</h2>
+        <h2>Текущий этап алгоритма</h2>
         <p className="muted" style={{ lineHeight: 1.6, marginBottom: 0 }}>
-          Каждый активный сотрудник с основной бригадой получает базовый цикл 24 часа
-          через каждые 4 дня. Цикл распределяется по четырём фазам внутри каждой бригады.
-          Учитываются даты начала и окончания работы. Вакансии пока не закрываются дополнительными
-          сменами — это следующий этап алгоритма.
+          Сейчас формируется только основной режим каждого сотрудника. Дополнительные 12- и 24-часовые
+          смены не назначаются автоматически, даже если сотрудник разрешил подработку. На следующем этапе
+          программа будет закрывать оставшиеся вакансии, используя только подходящих сотрудников и проверяя
+          их норму, отдых и допустимость переходов между сменами.
         </p>
       </section>
     </main>
