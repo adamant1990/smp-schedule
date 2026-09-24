@@ -13,17 +13,17 @@ type Brigade = {
 };
 
 export default function BrigadesPage() {
-  const supabase = createClient();
+  const [supabase, setSupabase] = useState<ReturnType<typeof createClient> | null>(null);
   const [brigades, setBrigades] = useState<Brigade[]>([]);
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState<string | null>(null);
   const [error, setError] = useState("");
 
-  async function loadBrigades() {
+  async function loadBrigades(client: ReturnType<typeof createClient>) {
     setLoading(true);
     setError("");
 
-    const { data, error: loadError } = await supabase
+    const { data, error: loadError } = await client
       .from("brigades")
       .select("id, number, name, required_feldshers, active")
       .order("number");
@@ -39,10 +39,13 @@ export default function BrigadesPage() {
   }
 
   useEffect(() => {
-    void loadBrigades();
+    const client = createClient();
+    setSupabase(client);
+    void loadBrigades(client);
   }, []);
 
   async function saveRequirement(id: string, value: number) {
+    if (!supabase) return;
     setSavingId(id);
     setError("");
 
