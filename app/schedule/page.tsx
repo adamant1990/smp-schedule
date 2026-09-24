@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import ExcelJS from "exceljs";
 import { createClient } from "@/lib/supabase/client";
 import {
   absenceKind,
@@ -74,6 +75,8 @@ export default function SchedulePage() {
   const [vacationSaving, setVacationSaving] = useState(false);
   const [assistantIssues, setAssistantIssues] = useState<AssistantIssue[]>([]);
   const [assistantChecked, setAssistantChecked] = useState(false);
+  const [importingExcel, setImportingExcel] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const days = monthDays(year, month);
   const brigadeMap = useMemo(
@@ -224,6 +227,134 @@ export default function SchedulePage() {
     }));
     setAssistantChecked(false);
     setAssistantIssues([]);
+  }
+
+  function normalizeImportName(value: unknown) {
+    return String(value ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/ё/g, "е")
+      .replace(/\\s+/g, " ");
+  }
+
+  function parseImportedShift(value: unknown): string {
+    const raw = String(value ?? "").trim().toUpperCase().replace(/–/g, "-");
+    if (!raw) return "";
+    if (raw === "В" || raw === "О" || raw === "ВЫХ" || raw === "ВЫХОДНОЙ") return raw === "В" ? "В" : "";
+    if (raw === "24" || raw.includes("24 Ч") || raw.includes("24Ч")) return "24";
+    if (raw === "12Д" || raw === "12 Д" || raw === "8-20" || raw === "08-20" || raw.includes("08:00-20:00")) return "12Д";
+    if (raw === "12Н" || raw === "12 Н" || raw === "20-8" || raw === "20-08" || raw.includes("20:00-08:00")) return "12Н";
+    if (raw === "8-17" || raw === "08-17" || raw === "08:00-17:00" || raw === "8–17") return "8–17";
+    return raw;
+  }
+
+  async function importExcelSchedule(file: File) {
+    setImportingExcel(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(await file.arrayBuffer());
+
+      const worksheet = workbook.worksheets[0];
+      if (!worksheet) throw new Error("В Excel-файле нет листов.");
+
+      let headerRow = 0;
+      let nameColumn = 0;
+      const dayColumns = new Map<number, number>();
+
+      for (let rowNumber = 1; rowNumber <= Math.min(15, worksheet.rowCount); rowNumber++) {
+        const row = worksheet.getRow(rowNumber);
+        let candidateNameColumn = 0;
+        const candidateDays = new Map<number, number>();
+
+        row.eachCell({ includeEmpty: false }, (cell, columnNumber) => {
+          const text = String(cell.text ?? cell.value ?? "").trim();
+          const normalized = normalizeImportName(text);
+          if (!candidateNameColumn && (normalized === "фио" || normalized.includes("ф.и.о") || normalized === "сотрудник" || normalized === "фельдшер")) {
+            candidateNameColumn = columnNumber;
+          }
+          const day = Number(text);
+          if (Number.isInteger(day) && day >= 1 && day <= days) {
+            candidateDays.set(day, columnNumber);
+          }
+        });
+
+        if (candidateNameColumn && candidateDays.size >= Math.min(5, days)) {
+          headerRow = rowNumber;
+          nameColumn = candidateNameColumn;
+          for (const [day, column] of candidateDays) dayColumns.set(day, column);
+          break;
+        }
+      }
+
+      if (!headerRow || !nameColumn || dayColumns.size === 0) {
+        throw new Error("Не удалось определить таблицу графика. Нужна строка с заголовком «ФИО» и столбцами дней 1, 2, 3...");
+      }
+
+      const employeeByName = new Map(
+        employees.map((employee) => [normalizeImportName(employee.full_name), employee])
+      );
+      const nextSchedule = makeEmptySchedule(employees, days);
+      let importedRows = 0;
+      let matchedRows = 0;
+      const unmatched: string[] = [];
+      const invalidCells: string[] = [];
+
+      for (let rowNumber = headerRow + 1; rowNumber <= worksheet.rowCount; rowNumber++) {
+        const row = worksheet.getRow(rowNumber);
+        const name = String(row.getCell(nameColumn).text ?? row.getCell(nameColumn).value ?? "").trim();
+        if (!name) continue;
+        importedRows++;
+
+        const employee = employeeByName.get(normalizeImportName(name));
+        if (!employee) {
+          unmatched.push(name);
+          continue;
+        }
+
+        matchedRows++;
+        for (const [day, column] of dayColumns) {
+          const value = parseImportedShift(row.getCell(column).text ?? row.getCell(column).value);
+          if (value === "В") {
+            nextSchedule[employee.id][day] = "В";
+          } else if (value === "" || value === "О") {
+            nextSchedule[employee.id][day] = "";
+          } else if (["12Д", "12Н", "24", "8–17"].includes(value)) {
+            nextSchedule[employee.id][day] = value;
+          } else {
+            invalidCells.push(name + ", день " + day + ": «" + value + "»");
+          }
+        }
+      }
+
+      if (!matchedRows) {
+        throw new Error("Ни один сотрудник из Excel не найден в списке сотрудников приложения.");
+      }
+
+      setSchedule(nextSchedule);
+      setAssistantChecked(false);
+      setAssistantIssues([]);
+      setGenerationReasons([]);
+
+      const parts = [
+        "Excel загружен: сопоставлено " + matchedRows + " из " + importedRows + " строк."
+      ];
+      if (unmatched.length) parts.push("Не найдены: " + unmatched.slice(0, 5).join(", ") + (unmatched.length > 5 ? " и ещё " + (unmatched.length - 5) : "") + ".");
+      if (invalidCells.length) parts.push("Не распознано ячеек: " + invalidCells.length + ".");
+      setMessage(parts.join(" "));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Не удалось загрузить Excel-файл.");
+    } finally {
+      setImportingExcel(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  function handleExcelFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (file) void importExcelSchedule(file);
   }
 
   function clearSchedule() {
@@ -556,6 +687,20 @@ export default function SchedulePage() {
         </div>
 
         <div className="schedule-actions">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls"
+            onChange={handleExcelFileChange}
+            style={{ display: "none" }}
+          />
+          <button
+            className="secondary-button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={importingExcel || loading}
+          >
+            {importingExcel ? "Загрузка Excel..." : "📥 Загрузить Excel"}
+          </button>
           <button className="secondary-button" onClick={clearSchedule}>Очистить</button>
           <button
             className="primary-button"
